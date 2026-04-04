@@ -38,13 +38,13 @@ if __name__ == "__main__":
     # -----------------------------
     # USER INPUT
     # -----------------------------
-    K = 12
+    K = 5
 
     # Realistic toy means:
     # - slightly lower early week
     # - higher Thursday/Friday
     # - still positive demand on weekend
-    weekday_means = [6.0, 6.5, 7.0, 7.5, 8.5, 5.0, 4.5]
+    weekday_means = [2.5, 3.5, 4.0, 3.5, 3.0, 2.0, 1.5]
 
     output_path = "weekday_demand_probabilities.xlsx"
 
