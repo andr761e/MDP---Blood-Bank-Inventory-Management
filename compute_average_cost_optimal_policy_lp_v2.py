@@ -14,23 +14,23 @@ from gurobipy import GRB
 # USER PARAMETERS
 # ============================================================
 
-# Excel input with rows Monday,...,Sunday and columns demand_0,...,demand_K
+# The path to the Excel file containing demand probabilities. Create this file first using the demand-matrix generator script.   
 DEMAND_XLSX_PATH = Path("weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
-# Model structure
+# Model parameters
 SHELF_LIFE = 5                 # platelet shelf life from purchase
-INVENTORY_CAP = 8              # max total inventory allowed immediately after ordering
-MAX_ORDER = 5                  # max units that can be ordered on a production day
-PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Monday-Friday; no production on weekend
+INVENTORY_CAP = 8              # Max total inventory allowed
+MAX_ORDER = 5                  # Max order quantity allowed
+PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
 # Costs
 C_OUTDATE = 4.0                # c_0
 C_SHORTAGE = 30.0              # c_s
 C_HOLDING = 1.0                # c_H
-C_PRODUCTION = 0.0             # optional production cost
+C_PRODUCTION = 0.0             # Optional cost for production (keep at 0 for now)
 
-# Output file
+# Output file name
 OUTPUT_XLSX_PATH = Path("data/optimal_stationary_policy_lp_v2.xlsx")
 
 # Numerical tolerances
@@ -38,10 +38,7 @@ REDUCED_COST_TOL = 1e-8
 PRINT_TOP_ROWS = 30
 
 
-# ============================================================
-# FIXED WEEKDAY ORDER
-# ============================================================
-
+# WEEKSDAYS
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
@@ -49,6 +46,7 @@ WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", 
 # INPUT: DEMAND PROBABILITIES
 # ============================================================
 
+# Opens excel file, finds demand columns, checks for missing weekdays, normalizes probabilities, and returns them as a numpy array. 
 def load_demand_probabilities(path: Path, sheet_name: str) -> tuple[np.ndarray, int]:
     if not path.exists():
         raise FileNotFoundError(
@@ -87,15 +85,16 @@ def load_demand_probabilities(path: Path, sheet_name: str) -> tuple[np.ndarray, 
 # STATE AND ACTION SPACE
 # ============================================================
 
-State = Tuple[int, ...]
+State = Tuple[int, ...] # Inventory vector (x_0, x_1, ..., x_{M-1}) 
 
-
+#Enumarate all inventory vectors with total inventory <= cap (INVENTORY_CAP). This is used to build the state space of the MDP, which consists of (day, inventory vector) pairs. The inventory vector tracks how many units have 1 day left, 2 days left, ..., up to shelf_life-1 days left. The total inventory is the sum of these components and must be <= INVENTORY_CAP.
 def all_inventory_vectors(cap: int, dims: int):
     for vec in product(range(cap + 1), repeat=dims):
         if sum(vec) <= cap:
             yield vec
 
 
+# Enumerate all states (day, inventory vector) with total inventory <= cap (INVENTORY_CAP). The day component cycles through 0 to 6 (Monday to Sunday), and the inventory vector tracks how many units have 1 day left, 2 days left, ..., up to shelf_life-1 days left. The total inventory is the sum of these components and must be <= INVENTORY_CAP.
 def enumerate_states(inventory_cap: int, shelf_life: int) -> List[State]:
     states = []
     for day in range(7):
@@ -103,7 +102,7 @@ def enumerate_states(inventory_cap: int, shelf_life: int) -> List[State]:
             states.append((day,) + tuple(inv))
     return states
 
-
+# Given a state, return the list of feasible actions (order quantities) that respect the inventory cap and production constraints. The state includes the current day and inventory vector, which allows us to determine if production is possible on that day and how much we can order without exceeding the inventory cap. If it's not a production day, the only feasible action is to order 0.
 def feasible_actions(
     state: State,
     inventory_cap: int,
@@ -124,6 +123,7 @@ def feasible_actions(
 # DYNAMICS: ACTION -> DEMAND -> FIFO -> AGEING
 # ============================================================
 
+# State observed at the start of the day, action taken, new units in, demand realized, then FIFO and ageing happen to get next state and costs. The state is a tuple where the first element is the day of the week (0=Monday, ..., 6=Sunday) and the remaining elements represent the inventory vector (x_1, x_2, ..., x_{m-1}), where x_i is the number of units with i days of shelf life remaining. The action is the order quantity placed at the start of the day. The demand is a random variable that will be realized after the action. The function computes the next state after applying FIFO (first-in-first-out) to meet demand and then ageing (decreasing shelf life by 1 day). It also calculates the shortage, outdate, and holding costs incurred during this transition.
 def step_dynamics(
     state: State,
     action: int,
@@ -153,7 +153,7 @@ def step_dynamics(
     holding = float(sum(next_inv))
     return next_state, shortage, outdate, holding
 
-
+# Given a state and action, compute the distribution over next states and the expected cost by integrating over the demand probabilities. The demand probabilities depend on the current day of the week, which is part of the state. For each possible demand realization, we use the step_dynamics function to find the next state and compute the cost incurred (outdate cost, shortage cost, holding cost, and production cost). We then aggregate these to get the overall distribution of next states and the expected cost for taking that action in the given state.
 def transition_distribution_and_expected_cost(
     state: State,
     action: int,
@@ -184,6 +184,7 @@ def transition_distribution_and_expected_cost(
 # SOLVE AVERAGE-COST MDP BY DUAL LINEAR PROGRAM
 # ============================================================
 
+# Formulate and solve the dual linear program for the average-cost MDP. Then extract the optimal average cost and a deterministic stationary policy. Also create a DataFrame summarizing the policy for each state. The dual LP has a variable g representing the average cost and variables h[s] representing the relative value function for each state. The constraints ensure that g + h[s] <= expected_cost(s,a) + sum_{s'} P(s'|s,a) h[s'] for all states s and actions a. After solving the LP, we extract the optimal policy by choosing the action that minimizes the right-hand side of the constraint for each state, using the optimal h values. We also create a DataFrame that includes the weekday, total stock, optimal order, Bellman minimum value, number of tied best actions, and the list of tied best actions for each state.
 def solve_average_cost_lp(
     states: List[State],
     actions_by_state: Dict[State, List[int]],
@@ -262,6 +263,7 @@ def solve_average_cost_lp(
 # EVALUATE THE EXTRACTED POLICY
 # ============================================================
 
+# Given a deterministic policy, build the transition probability matrix P and cost vector c for the induced Markov chain. Also return the action taken in each state and the mapping from states to indices. The transition matrix P is constructed by iterating over each state, applying the deterministic policy to get the action, and then using the transition_distribution_and_expected_cost function to find the distribution over next states and the expected cost for that action. The cost vector c contains the expected cost for taking the action prescribed by the policy in each state. The action vector a_vec contains the action taken in each state according to the policy. The idx mapping allows us to convert between states and their corresponding indices in the matrix and vectors.
 def build_transition_matrix_under_policy(
     states: List[State],
     det_policy: Dict[State, int],
@@ -286,7 +288,7 @@ def build_transition_matrix_under_policy(
 
     return P, c, a_vec, idx
 
-
+# Given the transition matrix P and cost vector c under a policy, compute the average cost by finding the stationary distribution of P and taking the weighted average of costs. The stationary distribution pi is found by solving the linear system pi = pi P with the normalization constraint sum(pi) = 1. Once we have pi, we can compute the average cost as the dot product of pi and c, which gives us the long-run average cost per time step under the given policy.
 def stationary_distribution_of_policy(P: np.ndarray) -> np.ndarray:
     """
     Solve pi = pi P, sum pi = 1
@@ -304,7 +306,7 @@ def stationary_distribution_of_policy(P: np.ndarray) -> np.ndarray:
     pi = pi / pi.sum()
     return pi
 
-
+# Build a DataFrame that includes the stationary probability of each state under the given policy, along with the optimal order and total stock. The DataFrame is sorted by stationary probability (descending), weekday (ascending), and total stock (ascending) to highlight the most likely states under the optimal policy. This table provides insights into which states are most frequently visited under the optimal policy and what actions are taken in those states.
 def build_state_probability_table(states: List[State], pi: np.ndarray, det_policy: Dict[State, int]) -> pd.DataFrame:
     rows = []
     for s, prob in zip(states, pi):
@@ -322,7 +324,8 @@ def build_state_probability_table(states: List[State], pi: np.ndarray, det_polic
     df = df.sort_values(["stationary_probability", "weekday", "total_stock"], ascending=[False, True, True])
     return df
 
-
+# This gives the most human-readable summary:
+# conditional on weekday, what does the optimal stationary policy typically order? The function iterates over each weekday, identifies the states corresponding to that weekday, and calculates the probability of being in those states under the stationary distribution. It then computes the expected order quantity given that weekday by taking a weighted average of the actions prescribed by the deterministic policy, using the stationary probabilities as weights. It also identifies the most likely action given the weekday and the distribution of actions. The resulting DataFrame summarizes the typical ordering behavior of the optimal policy for each weekday, which can be more interpretable than the full state-dependent policy. It includes the probability of each weekday, the expected order given the weekday, the most likely order, and the distribution of actions given the weekday.
 def build_weekday_recommendation_table(
     states: List[State],
     pi: np.ndarray,
@@ -369,7 +372,7 @@ def build_weekday_recommendation_table(
 
     return pd.DataFrame(rows)
 
-
+# Filter the state probability table to include only states with stationary probability above a certain cutoff. This helps to focus on the most relevant states under the optimal policy, as many states may have negligible probability and can be ignored for practical decision-making. The resulting DataFrame will contain only the states that are significantly visited under the optimal policy, making it easier to analyze and interpret the policy's behavior in those states.
 def build_visited_state_table(state_prob_df: pd.DataFrame, cutoff: float = 1e-6) -> pd.DataFrame:
     return state_prob_df[state_prob_df["stationary_probability"] > cutoff].copy()
 
@@ -378,6 +381,7 @@ def build_visited_state_table(state_prob_df: pd.DataFrame, cutoff: float = 1e-6)
 # OUTPUT HELPERS
 # ============================================================
 
+# Build a compact summary table that aggregates the optimal order by weekday and total stock level, showing the average optimal order and how many state profiles correspond to each (weekday, total_stock) pair. This table provides a more concise summary of the optimal policy by showing the typical order quantity for each combination of weekday and total stock level, along with the number of different inventory age profiles that lead to that combination. It can help identify general patterns in the optimal policy without having to look at every individual state.
 def build_compact_summary(policy_df: pd.DataFrame) -> pd.DataFrame:
     summary = (
         policy_df.groupby(["weekday", "total_stock"], sort=False)["optimal_order"]
@@ -392,6 +396,7 @@ def build_compact_summary(policy_df: pd.DataFrame) -> pd.DataFrame:
 # MAIN
 # ============================================================
 
+# Main function to load demand probabilities, build the state and action space, solve the average-cost MDP using the dual linear program, extract the optimal policy, evaluate it to find the stationary distribution and average cost, and save the results to an Excel file. The function also prints out key information about the problem setup, the optimal long-run cost, a readable summary of the policy by weekday, and the most visited states under the optimal policy. It ensures that the shelf life is at least 2, as the model assumes that there are at least two age buckets (x_1, x_2, ..., x_{m-1}) in the inventory vector. The outputs include the full optimal policy for all states, a compact summary by weekday and total stock, a table of visited states with their stationary probabilities, and a weekday-level recommendation table that summarizes the typical order quantity for each weekday under the optimal policy.
 def main():
     if SHELF_LIFE < 2:
         raise ValueError("SHELF_LIFE must be at least 2.")
