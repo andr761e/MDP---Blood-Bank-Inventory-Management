@@ -8,6 +8,7 @@ import gurobipy as gp
 import numpy as np
 import pandas as pd
 from gurobipy import GRB
+import matplotlib.pyplot as plt
 
 
 # ============================================================
@@ -19,9 +20,9 @@ DEMAND_XLSX_PATH = Path("weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters
-SHELF_LIFE = 5                 # platelet shelf life from purchase
-INVENTORY_CAP = 8              # Max total inventory allowed
-MAX_ORDER = 5                  # Max order quantity allowed
+SHELF_LIFE = 5                # platelet shelf life from purchase
+INVENTORY_CAP = 10              # Max total inventory allowed
+MAX_ORDER = 4                  # Max order quantity allowed
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
 # Costs
@@ -32,6 +33,9 @@ C_PRODUCTION = 0.0             # Optional cost for production (keep at 0 for now
 
 # Output file name
 OUTPUT_XLSX_PATH = Path("data/optimal_stationary_policy_lp_v2.xlsx")
+
+PLOTS_DIR = Path("data/policy_plots")
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Numerical tolerances
 REDUCED_COST_TOL = 1e-8
@@ -391,6 +395,190 @@ def build_compact_summary(policy_df: pd.DataFrame) -> pd.DataFrame:
     )
     return summary
 
+# ============================================================
+# OUTPUT HELPERS (continued)    
+# ============================================================
+def plot_policy_heatmap_avg_order(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    
+
+    heatmap_df = (
+        policy_df.pivot_table(
+            index="weekday",
+            columns="total_stock",
+            values="optimal_order",
+            aggfunc="mean"
+        )
+        .reindex(WEEKDAYS)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(heatmap_df.to_numpy(), aspect="auto")
+    plt.colorbar(label="Average optimal order")
+    plt.xticks(
+        ticks=np.arange(len(heatmap_df.columns)),
+        labels=heatmap_df.columns
+    )
+    plt.yticks(
+        ticks=np.arange(len(heatmap_df.index)),
+        labels=heatmap_df.index
+    )
+    plt.xlabel("Total stock")
+    plt.ylabel("Weekday")
+    plt.title("Average optimal order by weekday and total stock")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_policy_heatmap_weighted_order(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    grouped_rows = []
+    for (weekday, total_stock), group in policy_df.groupby(["weekday", "total_stock"]):
+        w = group["stationary_probability"].to_numpy()
+        x = group["optimal_order"].to_numpy()
+
+        if np.sum(w) <= 0:
+            weighted_avg_order = np.nan
+        else:
+            weighted_avg_order = np.sum(w * x) / np.sum(w)
+
+        grouped_rows.append({
+            "weekday": weekday,
+            "total_stock": total_stock,
+            "weighted_avg_order": weighted_avg_order,
+        })
+
+    grouped = pd.DataFrame(grouped_rows)
+
+    heatmap_df = (
+        grouped.pivot(index="weekday", columns="total_stock", values="weighted_avg_order")
+        .reindex(WEEKDAYS)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(heatmap_df.to_numpy(), aspect="auto")
+    plt.colorbar(label="Weighted average optimal order")
+    plt.xticks(
+        ticks=np.arange(len(heatmap_df.columns)),
+        labels=heatmap_df.columns
+    )
+    plt.yticks(
+        ticks=np.arange(len(heatmap_df.index)),
+        labels=heatmap_df.index
+    )
+    plt.xlabel("Total stock")
+    plt.ylabel("Weekday")
+    plt.title("Weighted average optimal order by weekday and total stock")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_stationary_probability_by_stock(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    prob_df = (
+        policy_df.groupby(["weekday", "total_stock"], as_index=False)["stationary_probability"]
+        .sum()
+    )
+
+    heatmap_df = (
+        prob_df.pivot(index="weekday", columns="total_stock", values="stationary_probability")
+        .reindex(WEEKDAYS)
+        .fillna(0.0)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(heatmap_df.to_numpy(), aspect="auto")
+    plt.colorbar(label="Stationary probability")
+    plt.xticks(
+        ticks=np.arange(len(heatmap_df.columns)),
+        labels=heatmap_df.columns
+    )
+    plt.yticks(
+        ticks=np.arange(len(heatmap_df.index)),
+        labels=heatmap_df.index
+    )
+    plt.xlabel("Total stock")
+    plt.ylabel("Weekday")
+    plt.title("Stationary probability mass by weekday and total stock")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_policy_scatter_all_states(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    weekday_to_num = {day: i for i, day in enumerate(WEEKDAYS)}
+
+    x = policy_df["total_stock"]
+    y = policy_df["optimal_order"]
+    c = policy_df["weekday"].map(weekday_to_num)
+
+    plt.figure(figsize=(12, 6))
+    plt.scatter(x, y, c=c)
+    plt.xlabel("Total stock")
+    plt.ylabel("Optimal order")
+    plt.title("Optimal order for all states")
+    cbar = plt.colorbar()
+    cbar.set_ticks(range(len(WEEKDAYS)))
+    cbar.set_ticklabels(WEEKDAYS)
+    cbar.set_label("Weekday")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_policy_scatter_weighted_states(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    weekday_to_num = {day: i for i, day in enumerate(WEEKDAYS)}
+
+    x = policy_df["total_stock"]
+    y = policy_df["optimal_order"]
+    c = policy_df["weekday"].map(weekday_to_num)
+    sizes = 50 + 5000 * policy_df["stationary_probability"].fillna(0.0)
+
+    plt.figure(figsize=(12, 6))
+    plt.scatter(x, y, c=c, s=sizes, alpha=0.6)
+    plt.xlabel("Total stock")
+    plt.ylabel("Optimal order")
+    plt.title("Optimal order for visited states, weighted by stationary probability")
+    cbar = plt.colorbar()
+    cbar.set_ticks(range(len(WEEKDAYS)))
+    cbar.set_ticklabels(WEEKDAYS)
+    cbar.set_label("Weekday")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    dist_df = (
+        policy_df.groupby(["weekday", "optimal_order"], as_index=False)["stationary_probability"]
+        .sum()
+    )
+
+    pivot_df = (
+        dist_df.pivot(index="weekday", columns="optimal_order", values="stationary_probability")
+        .reindex(WEEKDAYS)
+        .fillna(0.0)
+    )
+
+    x = np.arange(len(pivot_df.index))
+    bottom = np.zeros(len(pivot_df.index))
+
+    plt.figure(figsize=(12, 6))
+    for order_val in pivot_df.columns:
+        vals = pivot_df[order_val].to_numpy()
+        plt.bar(x, vals, bottom=bottom, label=f"Order {order_val}")
+        bottom += vals
+
+    plt.xticks(x, pivot_df.index, rotation=45)
+    plt.xlabel("Weekday")
+    plt.ylabel("Stationary probability mass")
+    plt.title("Distribution of optimal orders by weekday")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
 
 # ============================================================
 # MAIN
@@ -450,6 +638,14 @@ def main():
         compact_df.to_excel(writer, sheet_name="CompactSummary", index=False)
         weekday_plan_df.to_excel(writer, sheet_name="WeekdayPlan", index=False)
         visited_state_df.to_excel(writer, sheet_name="VisitedStates", index=False)
+    
+
+    plot_policy_heatmap_avg_order(policy_df, PLOTS_DIR / "heatmap_avg_order.png")
+    plot_policy_heatmap_weighted_order(policy_df,PLOTS_DIR / "heatmap_weighted_order.png")
+    plot_stationary_probability_by_stock(policy_df,PLOTS_DIR / "heatmap_stationary_probability.png")
+    plot_policy_scatter_all_states(policy_df,PLOTS_DIR / "scatter_all_states.png")
+    plot_policy_scatter_weighted_states(policy_df,PLOTS_DIR / "scatter_weighted_states.png")
+    plot_order_distribution_by_weekday(policy_df,PLOTS_DIR / "order_distribution_by_weekday.png")
 
     print("\nOPTIMAL LONG-RUN COST")
     print(f"Per day:   {g_star:.6f}")
@@ -470,6 +666,9 @@ def main():
 
     print("\nSaved detailed outputs to:")
     print(f"  {OUTPUT_XLSX_PATH}")
+    print(f"  Plots directory:           {PLOTS_DIR}")
+
+    
 
 
 if __name__ == "__main__":

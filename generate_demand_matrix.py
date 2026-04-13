@@ -38,7 +38,7 @@ if __name__ == "__main__":
     # -----------------------------
     # USER INPUT
     # -----------------------------
-    K = 5
+    K = 10
 
     # Realistic toy means:
     # - slightly lower early week
