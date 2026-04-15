@@ -21,15 +21,15 @@ DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters
 SHELF_LIFE = 5                # platelet shelf life from purchase
-INVENTORY_CAP = 10              # Max total inventory allowed
-MAX_ORDER = 4                  # Max order quantity allowed
+INVENTORY_CAP = 15              # Max total inventory allowed
+MAX_ORDER = 6                  # Max order quantity allowed
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
 # Costs
-C_OUTDATE = 4.0                # c_0
-C_SHORTAGE = 30.0              # c_s
-C_HOLDING = 1.0                # c_H
-C_PRODUCTION = 0.0             # Optional cost for production (keep at 0 for now)
+C_OUTDATE = 2500.0                # c_0
+C_SHORTAGE = 20000.0              # c_s
+C_HOLDING = 5.0                   # c_H
+C_PRODUCTION = 2500.0             # Optional cost for production (keep at 0 for now)
 
 # Output file name
 OUTPUT_XLSX_PATH = Path("data/optimal_stationary_policy_lp_v2.xlsx")

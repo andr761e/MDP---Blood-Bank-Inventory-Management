@@ -19,8 +19,8 @@ DEMAND_XLSX_PATH = Path("weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
 SHELF_LIFE = 5
-INVENTORY_CAP = 10
-MAX_ORDER = 5
+INVENTORY_CAP = 15
+MAX_ORDER = 6
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}
 
 C_OUTDATE = 4.0
