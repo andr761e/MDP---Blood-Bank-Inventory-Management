@@ -4,10 +4,10 @@ import pandas as pd
 
 
 # Parameters for demand generation
-units_per_model_unit = 8  # 1 model unit = 6 real products; this is to keep the LP manageable
+units_per_model_unit = 6  # 1 model unit = 7 real products; this is to keep the LP manageable
 max_noise = 3             # noise in {0,1,...,max_noise}
-noise_lambdas = [1.4, 1.3, 1.2, 1.4, 1.2, 0.8, 0.9] # Poisson lambda for each weekday's noise; can be adjusted as needed 
-weekday_weights = [1.10, 1.10, 1.05, 1.05, 1.00, 0.85, 0.85] # relative weekday weights; can be adjusted as needed
+noise_lambdas = [1.2, 1.3, 1.4, 1.3, 1.2, 0.5, 0.6] # Poisson lambda for each weekday's noise; can be adjusted as needed 
+weekday_weights = [24, 19, 30, 18, 23, 5, 7] # relative weekday weights; based on historical data but can be adjusted as needed
 
 
 def poisson_pmf(k: int, lam: float) -> float:
