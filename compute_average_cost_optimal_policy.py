@@ -122,6 +122,45 @@ def feasible_actions(
     max_feasible = min(max_order, inventory_cap - current_stock)
     return list(range(max_feasible + 1))
 
+# Check if a state is structurally feasible given the production constraints. For example, on Monday (day=0), we cannot have any inventory with 3 or 4 days of shelf life remaining, because that would imply production on Saturday or Sunday, which is not allowed. Similarly, on Tuesday (day=1), we cannot have inventory with 3 days of shelf life remaining, and on Sunday (day=6), we cannot have inventory with 4 days of shelf life remaining. This function can be used to filter out states that are impossible to reach under the given production schedule.
+def structurally_feasible_state(state: State) -> bool:
+    day = state[0]
+    x1, x2, x3, x4 = state[1:]
+
+    # Monday: cannot have units with 3 or 4 days left
+    if day == 0:
+        if x3 > 0 or x4 > 0:
+            return False
+
+    # Tuesday: cannot have units with 2 or 3 days left
+    elif day == 1:
+        if x2 > 0 or x3 > 0:
+            return False
+
+    # Wednesday: cannot have units with 1 or 2 days left
+    elif day == 2:
+        if x1 > 0 or x2 > 0:
+            return False
+
+    # Thursday: cannot have units with 1 day left
+    elif day == 3:
+        if x1 > 0:
+            return False
+
+    # Friday: everything is possible
+    elif day == 4:
+        pass
+
+    # Saturday: everything is possible
+    elif day == 5:
+        pass
+
+    # Sunday: cannot have units with 4 days left
+    elif day == 6:
+        if x4 > 0:
+            return False
+
+    return True
 
 # ============================================================
 # DYNAMICS: ACTION -> DEMAND -> FIFO -> AGEING
@@ -591,6 +630,7 @@ def main():
 
     demand_pmf, K = load_demand_probabilities(DEMAND_XLSX_PATH, DEMAND_SHEET_NAME)
     states = enumerate_states(INVENTORY_CAP, SHELF_LIFE)
+    states = [s for s in states if structurally_feasible_state(s)]      # Filter out states that are impossible to reach under the production constraints, to reduce the state space and speed up computation.
     actions_by_state = {
         s: feasible_actions(s, INVENTORY_CAP, MAX_ORDER, PRODUCTION_DAYS)
         for s in states
