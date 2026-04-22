@@ -27,7 +27,7 @@ PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ...,
 
 # Costs
 C_OUTDATE = 2500.0                # c_0
-C_SHORTAGE = 10000.0              # c_s
+C_SHORTAGE = 20000.0              # c_s
 C_HOLDING = 5.0                   # c_H
 C_PRODUCTION = 2500.0             # Optional cost for production (keep at 0 for now)
 
@@ -122,43 +122,96 @@ def feasible_actions(
     max_feasible = min(max_order, inventory_cap - current_stock)
     return list(range(max_feasible + 1))
 
+
+def extract_min_demand_by_day(demand_pmf: np.ndarray, tol: float = 1e-12) -> Dict[int, int]:
+    """
+    For each weekday d, return the smallest demand k with positive probability.
+    """
+    min_demand_by_day: Dict[int, int] = {}
+
+    for day in range(demand_pmf.shape[0]):
+        positive_demands = np.where(demand_pmf[day, :] > tol)[0]
+        if len(positive_demands) == 0:
+            raise ValueError(f"No positive-demand support found for weekday index {day}.")
+        min_demand_by_day[day] = int(positive_demands[0])
+
+    return min_demand_by_day
+
+def compute_max_total_inventory_by_day(min_demand_by_day: Dict[int, int]) -> Dict[int, int]:
+    """
+    Compute a safe upper bound on total inventory at the start of each weekday.
+
+    Logic:
+    Work backwards from the target day until the most recent production day.
+    Starting from INVENTORY_CAP on that production day (after ordering),
+    subtract the minimum demand for each intervening day up to the day before
+    the target day.
+    """
+    max_total_by_day: Dict[int, int] = {}
+
+    for target_day in range(7):
+        days_to_subtract = []
+
+        current = (target_day - 1) % 7
+        while True:
+            days_to_subtract.append(current)
+            if current in PRODUCTION_DAYS:
+                break
+            current = (current - 1) % 7
+
+        bound = INVENTORY_CAP - sum(min_demand_by_day[d] for d in days_to_subtract)
+        max_total_by_day[target_day] = max(0, bound)
+
+    return max_total_by_day
+
+
+
 # Check if a state is structurally feasible given the production constraints. For example, on Monday (day=0), we cannot have any inventory with 3 or 4 days of shelf life remaining, because that would imply production on Saturday or Sunday, which is not allowed. Similarly, on Tuesday (day=1), we cannot have inventory with 3 days of shelf life remaining, and on Sunday (day=6), we cannot have inventory with 4 days of shelf life remaining. This function can be used to filter out states that are impossible to reach under the given production schedule.
-def structurally_feasible_state(state: State) -> bool:
+def structurally_feasible_state(
+    state: State,
+    max_total_by_day: Dict[int, int],
+) -> bool:
     day = state[0]
     x1, x2, x3, x4 = state[1:]
+    total_stock = x1 + x2 + x3 + x4
 
-    # Monday: cannot have units with 3 or 4 days left
-    if day == 0:
+    # No single age bucket can exceed one day's production
+    if any(x > MAX_ORDER for x in (x1, x2, x3, x4)):
+        return False
+
+    # Dynamic upper bound on total stock from minimum-demand support
+    if total_stock > max_total_by_day[day]:
+        return False
+
+    # Weekday-specific impossibilities caused by no production on weekends
+    if day == 0:  # Monday
         if x3 > 0 or x4 > 0:
             return False
 
-    # Tuesday: cannot have units with 2 or 3 days left
-    elif day == 1:
+    elif day == 1:  # Tuesday
         if x2 > 0 or x3 > 0:
             return False
 
-    # Wednesday: cannot have units with 1 or 2 days left
-    elif day == 2:
+    elif day == 2:  # Wednesday
         if x1 > 0 or x2 > 0:
             return False
 
-    # Thursday: cannot have units with 1 day left
-    elif day == 3:
+    elif day == 3:  # Thursday
         if x1 > 0:
             return False
 
-    # Friday: everything is possible
-    elif day == 4:
+    elif day == 4:  # Friday
         pass
 
-    # Saturday: everything is possible
-    elif day == 5:
+    elif day == 5:  # Saturday
         pass
 
-    # Sunday: cannot have units with 4 days left
-    elif day == 6:
+    elif day == 6:  # Sunday
         if x4 > 0:
             return False
+
+    else:
+        return False
 
     return True
 
@@ -210,6 +263,9 @@ def transition_distribution_and_expected_cost(
     expected_cost = 0.0
 
     for demand, p in enumerate(probs):
+        if p <= 1e-12:
+            continue
+
         next_state, shortage, outdate, holding = step_dynamics(state, action, demand, shelf_life)
         cost = (
             C_OUTDATE * outdate
@@ -629,8 +685,15 @@ def main():
         raise ValueError("SHELF_LIFE must be at least 2.")
 
     demand_pmf, K = load_demand_probabilities(DEMAND_XLSX_PATH, DEMAND_SHEET_NAME)
+
+
+    min_demand_by_day = extract_min_demand_by_day(demand_pmf)
+    max_total_by_day = compute_max_total_inventory_by_day(min_demand_by_day)
+    print("Minimum demand with positive probability by weekday:", {WEEKDAYS[d]: k for d, k in min_demand_by_day.items()})
+    print("Computed upper bound on total inventory by weekday:", {WEEKDAYS[d]: max_total_by_day[d] for d in range(7)})
+
     states = enumerate_states(INVENTORY_CAP, SHELF_LIFE)
-    states = [s for s in states if structurally_feasible_state(s)]      # Filter out states that are impossible to reach under the production constraints, to reduce the state space and speed up computation.
+    states = [s for s in states if structurally_feasible_state(s, max_total_by_day)]      # Filter out states that are impossible to reach under the production constraints, to reduce the state space and speed up computation.
     actions_by_state = {
         s: feasible_actions(s, INVENTORY_CAP, MAX_ORDER, PRODUCTION_DAYS)
         for s in states
