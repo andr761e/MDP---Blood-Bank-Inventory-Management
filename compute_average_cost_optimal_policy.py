@@ -172,46 +172,29 @@ def structurally_feasible_state(
     max_total_by_day: Dict[int, int],
 ) -> bool:
     day = state[0]
-    x1, x2, x3, x4 = state[1:]
-    total_stock = x1 + x2 + x3 + x4
+    inv = state[1:]
+    total_stock = sum(inv)
 
     # No single age bucket can exceed one day's production
-    if any(x > MAX_ORDER for x in (x1, x2, x3, x4)):
+    if any(x > MAX_ORDER for x in inv):
         return False
 
     # Dynamic upper bound on total stock from minimum-demand support
     if total_stock > max_total_by_day[day]:
         return False
 
-    # Weekday-specific impossibilities caused by no production on weekends
-    if day == 0:  # Monday
-        if x3 > 0 or x4 > 0:
+    # General production-day logic:
+    # x_r at day d can only be positive if production was possible
+    # exactly (SHELF_LIFE - r) days earlier.
+    #
+    # inv[0] = x1, inv[1] = x2, ..., inv[SHELF_LIFE-2] = x_{SHELF_LIFE-1}
+    for idx, x in enumerate(inv):
+        r = idx + 1
+        days_back = SHELF_LIFE - r
+        origin_day = (day - days_back) % 7
+
+        if x > 0 and origin_day not in PRODUCTION_DAYS:
             return False
-
-    elif day == 1:  # Tuesday
-        if x2 > 0 or x3 > 0:
-            return False
-
-    elif day == 2:  # Wednesday
-        if x1 > 0 or x2 > 0:
-            return False
-
-    elif day == 3:  # Thursday
-        if x1 > 0:
-            return False
-
-    elif day == 4:  # Friday
-        pass
-
-    elif day == 5:  # Saturday
-        pass
-
-    elif day == 6:  # Sunday
-        if x4 > 0:
-            return False
-
-    else:
-        return False
 
     return True
 
