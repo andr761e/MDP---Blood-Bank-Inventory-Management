@@ -21,8 +21,8 @@ DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters
 SHELF_LIFE = 5                # platelet shelf life from purchase
-INVENTORY_CAP = 15              # Max total inventory allowed
-MAX_ORDER = 9                  # Max order quantity allowed
+INVENTORY_CAP = 35            # Max total inventory allowed (15)
+MAX_ORDER = 30                 # Max order quantity allowed (9)
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
 # Costs
@@ -638,10 +638,15 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
         .fillna(0.0)
     )
 
+    # Keep only order sizes that actually occur with positive stationary mass
+    used_orders = [col for col in pivot_df.columns if pivot_df[col].sum() > 1e-12]
+    pivot_df = pivot_df[used_orders]
+
     x = np.arange(len(pivot_df.index))
     bottom = np.zeros(len(pivot_df.index))
 
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(14, 7))
+
     for order_val in pivot_df.columns:
         vals = pivot_df[order_val].to_numpy()
         plt.bar(x, vals, bottom=bottom, label=f"Order {order_val}")
@@ -651,9 +656,21 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
     plt.xlabel("Weekday")
     plt.ylabel("Stationary probability mass")
     plt.title("Distribution of optimal orders by weekday")
-    plt.legend()
+
+    # Put legend outside and use multiple columns if there are many order sizes
+    n_orders = len(pivot_df.columns)
+    ncol = min(4, max(1, int(np.ceil(n_orders / 8))))
+
+    plt.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        ncol=ncol,
+        borderaxespad=0.0,
+        title="Order size"
+    )
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close()
 
 

@@ -19,8 +19,8 @@ DEMAND_XLSX_PATH = Path("weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
 SHELF_LIFE = 5
-INVENTORY_CAP = 15
-MAX_ORDER = 9
+INVENTORY_CAP = 35
+MAX_ORDER = 30
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}
 
 C_OUTDATE = 2500.0
@@ -28,7 +28,7 @@ C_SHORTAGE = 20000.0
 C_HOLDING = 5.0
 C_PRODUCTION = 2500.0
 
-START_STATE = (2, 0, 0, 0, 2)  # (weekday, x1, x2, ..., x_{SHELF_LIFE-1})
+START_STATE = (2, 0, 0, 0, 5)  # (weekday, x1, x2, ..., x_{SHELF_LIFE-1})
 SIMULATION_DAYS = 730
 RANDOM_SEED = 42
 N_REPLICATIONS = 1
@@ -120,6 +120,80 @@ def feasible_actions(
     max_feasible = min(max_order, inventory_cap - current_stock)
     return list(range(max_feasible + 1))
 
+def extract_min_demand_by_day(demand_pmf: np.ndarray, tol: float = 1e-12) -> Dict[int, int]:
+    """
+    For each weekday d, return the smallest demand k with positive probability.
+    """
+    min_demand_by_day: Dict[int, int] = {}
+
+    for day in range(demand_pmf.shape[0]):
+        positive_demands = np.where(demand_pmf[day, :] > tol)[0]
+        if len(positive_demands) == 0:
+            raise ValueError(f"No positive-demand support found for weekday index {day}.")
+        min_demand_by_day[day] = int(positive_demands[0])
+
+    return min_demand_by_day
+
+def compute_max_total_inventory_by_day(min_demand_by_day: Dict[int, int]) -> Dict[int, int]:
+    """
+    Compute a safe upper bound on total inventory at the start of each weekday.
+
+    Logic:
+    Work backwards from the target day until the most recent production day.
+    Starting from INVENTORY_CAP on that production day (after ordering),
+    subtract the minimum demand for each intervening day up to the day before
+    the target day.
+    """
+    max_total_by_day: Dict[int, int] = {}
+
+    for target_day in range(7):
+        days_to_subtract = []
+
+        current = (target_day - 1) % 7
+        while True:
+            days_to_subtract.append(current)
+            if current in PRODUCTION_DAYS:
+                break
+            current = (current - 1) % 7
+
+        bound = INVENTORY_CAP - sum(min_demand_by_day[d] for d in days_to_subtract)
+        max_total_by_day[target_day] = max(0, bound)
+
+    return max_total_by_day
+
+
+
+# Check if a state is structurally feasible given the production constraints. For example, on Monday (day=0), we cannot have any inventory with 3 or 4 days of shelf life remaining, because that would imply production on Saturday or Sunday, which is not allowed. Similarly, on Tuesday (day=1), we cannot have inventory with 3 days of shelf life remaining, and on Sunday (day=6), we cannot have inventory with 4 days of shelf life remaining. This function can be used to filter out states that are impossible to reach under the given production schedule.
+def structurally_feasible_state(
+    state: State,
+    max_total_by_day: Dict[int, int],
+) -> bool:
+    day = state[0]
+    inv = state[1:]
+    total_stock = sum(inv)
+
+    # No single age bucket can exceed one day's production
+    if any(x > MAX_ORDER for x in inv):
+        return False
+
+    # Dynamic upper bound on total stock from minimum-demand support
+    if total_stock > max_total_by_day[day]:
+        return False
+
+    # General production-day logic:
+    # x_r at day d can only be positive if production was possible
+    # exactly (SHELF_LIFE - r) days earlier.
+    #
+    # inv[0] = x1, inv[1] = x2, ..., inv[SHELF_LIFE-2] = x_{SHELF_LIFE-1}
+    for idx, x in enumerate(inv):
+        r = idx + 1
+        days_back = SHELF_LIFE - r
+        origin_day = (day - days_back) % 7
+
+        if x > 0 and origin_day not in PRODUCTION_DAYS:
+            return False
+
+    return True
 
 # ============================================================
 # DYNAMICS
@@ -184,9 +258,13 @@ def transition_distribution_and_expected_cost(
     expected_cost = 0.0
 
     for demand, p in enumerate(probs):
+        if p <= 1e-12:
+            continue
+
         details = step_dynamics_detailed(state, action, demand, shelf_life)
         cost = details["period_cost"]
         next_state = details["next_state"]
+
         dist[next_state] = dist.get(next_state, 0.0) + float(p)
         expected_cost += float(p) * cost
 
@@ -643,7 +721,12 @@ def main():
         raise ValueError("START_STATE exceeds INVENTORY_CAP.")
 
     demand_pmf, K = load_demand_probabilities(DEMAND_XLSX_PATH, DEMAND_SHEET_NAME)
+
+    min_demand_by_day = extract_min_demand_by_day(demand_pmf)
+    max_total_by_day = compute_max_total_inventory_by_day(min_demand_by_day)
+
     states = enumerate_states(INVENTORY_CAP, SHELF_LIFE)
+    states = [s for s in states if structurally_feasible_state(s, max_total_by_day)]
     actions_by_state = {
         s: feasible_actions(s, INVENTORY_CAP, MAX_ORDER, PRODUCTION_DAYS)
         for s in states
