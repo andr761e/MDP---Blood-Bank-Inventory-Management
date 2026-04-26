@@ -19,7 +19,7 @@ DEMAND_XLSX_PATH = Path("weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
 SHELF_LIFE = 5
-INVENTORY_CAP = 35
+INVENTORY_CAP = 39
 MAX_ORDER = 30
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}
 
@@ -28,7 +28,7 @@ C_SHORTAGE = 20000.0
 C_HOLDING = 5.0
 C_PRODUCTION = 2500.0
 
-START_STATE = (2, 0, 0, 0, 5)  # (weekday, x1, x2, ..., x_{SHELF_LIFE-1})
+START_STATE = (2, 0, 0, 0, 8)  # (weekday, x1, x2, ..., x_{SHELF_LIFE-1})
 SIMULATION_DAYS = 730
 RANDOM_SEED = 42
 N_REPLICATIONS = 1

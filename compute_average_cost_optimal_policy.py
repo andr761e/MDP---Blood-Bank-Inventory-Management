@@ -21,7 +21,7 @@ DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters
 SHELF_LIFE = 5                # platelet shelf life from purchase
-INVENTORY_CAP = 35            # Max total inventory allowed (15)
+INVENTORY_CAP = 39            # Max total inventory allowed (15)
 MAX_ORDER = 30                 # Max order quantity allowed (9)
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
