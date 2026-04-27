@@ -3,6 +3,7 @@ from __future__ import annotations
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Tuple
+from collections import deque
 
 import gurobipy as gp
 import numpy as np
@@ -197,6 +198,87 @@ def structurally_feasible_state(
             return False
 
     return True
+
+def positive_demand_values_by_day(demand_pmf: np.ndarray, tol: float = 1e-12):
+    return {
+        day: [int(k) for k, p in enumerate(demand_pmf[day, :]) if p > tol]
+        for day in range(demand_pmf.shape[0])
+    }
+
+
+def reachable_state_filter(
+    candidate_states: List[State],
+    demand_pmf: np.ndarray,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+    shelf_life: int,
+    initial_states: List[State],
+) -> List[State]:
+
+    candidate_set = set(candidate_states)
+    positive_demands = positive_demand_values_by_day(demand_pmf)
+
+    reachable = set()
+    queue = deque()
+
+    for s in initial_states:
+        if s in candidate_set:
+            reachable.add(s)
+            queue.append(s)
+
+    while queue:
+        s = queue.popleft()
+        day = s[0]
+
+        for a in feasible_actions(s, inventory_cap, max_order, production_days):
+            for demand in positive_demands[day]:
+                ns, _, _, _ = step_dynamics(
+                    state=s,
+                    action=a,
+                    demand=demand,
+                    shelf_life=shelf_life,
+                )
+
+                if ns in candidate_set and ns not in reachable:
+                    reachable.add(ns)
+                    queue.append(ns)
+
+    return sorted(reachable)
+
+
+def assert_transition_closed(
+    states: List[State],
+    demand_pmf: np.ndarray,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+    shelf_life: int,
+) -> None:
+
+    state_set = set(states)
+    positive_demands = positive_demand_values_by_day(demand_pmf)
+
+    for s in states:
+        day = s[0]
+
+        for a in feasible_actions(s, inventory_cap, max_order, production_days):
+            for demand in positive_demands[day]:
+                ns, _, _, _ = step_dynamics(
+                    state=s,
+                    action=a,
+                    demand=demand,
+                    shelf_life=shelf_life,
+                )
+
+                if ns not in state_set:
+                    raise ValueError(
+                        f"Pruned state space is not transition-closed.\n"
+                        f"State: {s}\n"
+                        f"Action: {a}\n"
+                        f"Demand: {demand}\n"
+                        f"Next state: {ns}"
+                    )
 
 # ============================================================
 # DYNAMICS: ACTION -> DEMAND -> FIFO -> AGEING
@@ -686,19 +768,44 @@ def main():
 
     demand_pmf, K = load_demand_probabilities(DEMAND_XLSX_PATH, DEMAND_SHEET_NAME)
 
-
     min_demand_by_day = extract_min_demand_by_day(demand_pmf)
     max_total_by_day = compute_max_total_inventory_by_day(min_demand_by_day)
     print("Minimum demand with positive probability by weekday:", {WEEKDAYS[d]: k for d, k in min_demand_by_day.items()})
     print("Computed upper bound on total inventory by weekday:", {WEEKDAYS[d]: max_total_by_day[d] for d in range(7)})
 
     states = enumerate_states(INVENTORY_CAP, SHELF_LIFE)
-    states = [s for s in states if structurally_feasible_state(s, max_total_by_day)]      # Filter out states that are impossible to reach under the production constraints, to reduce the state space and speed up computation.
+    print(f"States before filtering: {len(states)}")
+
+    states = [s for s in states if structurally_feasible_state(s, max_total_by_day)]
+    print(f"States after structural filtering: {len(states)}")
+
+    initial_state = (0,) + (0,) * (SHELF_LIFE - 1)
+
+    states = reachable_state_filter(
+        candidate_states=states,
+        demand_pmf=demand_pmf,
+        inventory_cap=INVENTORY_CAP,
+        max_order=MAX_ORDER,
+        production_days=PRODUCTION_DAYS,
+        shelf_life=SHELF_LIFE,
+        initial_states=[initial_state],
+    )
+
+    print(f"States after reachability filtering: {len(states)}")
+
+    assert_transition_closed(
+        states=states,
+        demand_pmf=demand_pmf,
+        inventory_cap=INVENTORY_CAP,
+        max_order=MAX_ORDER,
+        production_days=PRODUCTION_DAYS,
+        shelf_life=SHELF_LIFE,
+    )
+
     actions_by_state = {
         s: feasible_actions(s, INVENTORY_CAP, MAX_ORDER, PRODUCTION_DAYS)
         for s in states
     }
-
     num_state_action_pairs = sum(len(v) for v in actions_by_state.values())
 
     print("=" * 72)
@@ -735,8 +842,44 @@ def main():
     visited_state_df = build_visited_state_table(state_prob_df, cutoff=1e-6)
     weekday_plan_df = build_weekday_recommendation_table(states, pi, det_policy)
 
+    g_eval = float(np.dot(pi, c_vec))
+
+    run_summary_df = pd.DataFrame({
+        "metric": [
+            "optimal_average_cost_per_day_from_lp",
+            "optimal_average_cost_per_week_from_lp",
+            "average_cost_per_day_from_stationary_distribution",
+            "average_cost_per_week_from_stationary_distribution",
+            "number_of_states_after_filtering",
+            "number_of_state_action_pairs",
+            "shelf_life",
+            "inventory_cap",
+            "max_order",
+            "c_outdate",
+            "c_shortage",
+            "c_holding",
+            "c_production",
+        ],
+        "value": [
+            g_star,
+            7.0 * g_star,
+            g_eval,
+            7.0 * g_eval,
+            len(states),
+            num_state_action_pairs,
+            SHELF_LIFE,
+            INVENTORY_CAP,
+            MAX_ORDER,
+            C_OUTDATE,
+            C_SHORTAGE,
+            C_HOLDING,
+            C_PRODUCTION,
+        ]
+    })
+
     # Save everything
     with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
+        run_summary_df.to_excel(writer, sheet_name="RunSummary", index=False)
         policy_df.to_excel(writer, sheet_name="OptimalPolicy_AllStates", index=False)
         compact_df.to_excel(writer, sheet_name="CompactSummary", index=False)
         weekday_plan_df.to_excel(writer, sheet_name="WeekdayPlan", index=False)

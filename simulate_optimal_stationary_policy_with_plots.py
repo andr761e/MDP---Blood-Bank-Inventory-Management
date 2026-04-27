@@ -3,6 +3,7 @@ from __future__ import annotations
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Tuple
+from collections import deque
 
 import gurobipy as gp
 import matplotlib.pyplot as plt
@@ -194,6 +195,92 @@ def structurally_feasible_state(
             return False
 
     return True
+
+def positive_demand_values_by_day(demand_pmf: np.ndarray, tol: float = 1e-12):
+    return {
+        day: [int(k) for k, p in enumerate(demand_pmf[day, :]) if p > tol]
+        for day in range(demand_pmf.shape[0])
+    }
+
+
+def reachable_state_filter(
+    candidate_states: List[State],
+    demand_pmf: np.ndarray,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+    shelf_life: int,
+    initial_states: List[State],
+) -> List[State]:
+
+    candidate_set = set(candidate_states)
+    positive_demands = positive_demand_values_by_day(demand_pmf)
+
+    reachable = set()
+    queue = deque()
+
+    for s in initial_states:
+        if s not in candidate_set:
+            raise ValueError(
+                f"Initial state {s} is not in the structurally feasible state space."
+            )
+        reachable.add(s)
+        queue.append(s)
+
+    while queue:
+        s = queue.popleft()
+        day = s[0]
+
+        for a in feasible_actions(s, inventory_cap, max_order, production_days):
+            for demand in positive_demands[day]:
+                details = step_dynamics_detailed(
+                    state=s,
+                    action=a,
+                    demand=demand,
+                    shelf_life=shelf_life,
+                )
+                ns = details["next_state"]
+
+                if ns in candidate_set and ns not in reachable:
+                    reachable.add(ns)
+                    queue.append(ns)
+
+    return sorted(reachable)
+
+
+def assert_transition_closed(
+    states: List[State],
+    demand_pmf: np.ndarray,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+    shelf_life: int,
+) -> None:
+
+    state_set = set(states)
+    positive_demands = positive_demand_values_by_day(demand_pmf)
+
+    for s in states:
+        day = s[0]
+
+        for a in feasible_actions(s, inventory_cap, max_order, production_days):
+            for demand in positive_demands[day]:
+                details = step_dynamics_detailed(
+                    state=s,
+                    action=a,
+                    demand=demand,
+                    shelf_life=shelf_life,
+                )
+                ns = details["next_state"]
+
+                if ns not in state_set:
+                    raise ValueError(
+                        f"Reachability-filtered state space is not transition-closed.\n"
+                        f"State: {s}\n"
+                        f"Action: {a}\n"
+                        f"Demand: {demand}\n"
+                        f"Next state: {ns}"
+                    )
 
 # ============================================================
 # DYNAMICS
@@ -726,7 +813,32 @@ def main():
     max_total_by_day = compute_max_total_inventory_by_day(min_demand_by_day)
 
     states = enumerate_states(INVENTORY_CAP, SHELF_LIFE)
+    print(f"States before filtering: {len(states)}")
+
     states = [s for s in states if structurally_feasible_state(s, max_total_by_day)]
+    print(f"States after structural filtering: {len(states)}")
+
+    states = reachable_state_filter(
+        candidate_states=states,
+        demand_pmf=demand_pmf,
+        inventory_cap=INVENTORY_CAP,
+        max_order=MAX_ORDER,
+        production_days=PRODUCTION_DAYS,
+        shelf_life=SHELF_LIFE,
+        initial_states=[START_STATE],
+    )
+
+    print(f"States after reachability filtering from START_STATE: {len(states)}")
+
+    assert_transition_closed(
+        states=states,
+        demand_pmf=demand_pmf,
+        inventory_cap=INVENTORY_CAP,
+        max_order=MAX_ORDER,
+        production_days=PRODUCTION_DAYS,
+        shelf_life=SHELF_LIFE,
+    )
+
     actions_by_state = {
         s: feasible_actions(s, INVENTORY_CAP, MAX_ORDER, PRODUCTION_DAYS)
         for s in states
