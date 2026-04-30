@@ -27,10 +27,10 @@ MAX_ORDER = 30                 # Max order quantity allowed (9)
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
 # Costs
-C_OUTDATE = 2500.0                # c_0
+C_OUTDATE = 2410.0                # c_0
 C_SHORTAGE = 20000.0              # c_s
 C_HOLDING = 5.0                   # c_H
-C_PRODUCTION = 2500.0             # Optional cost for production (keep at 0 for now)
+C_PRODUCTION = 2410.0             # Optional cost for production (keep at 0 for now)
 
 # Output file name
 OUTPUT_XLSX_PATH = Path("data/optimal_stationary_policy_lp_v2.xlsx")
