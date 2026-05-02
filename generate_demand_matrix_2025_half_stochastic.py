@@ -17,6 +17,13 @@ units_per_model_unit = 1
 calendar_year = 2025
 annual_weekday_demands = [963, 883, 837, 939, 905, 607, 555]
 
+demand_multiplier = 1.0  # use 1.00 for baseline, 1.10 for model risk evaluation
+
+annual_weekday_demands = [
+    x * demand_multiplier
+    for x in annual_weekday_demands
+]
+
 # IMPORTANT INTERPRETATION:
 # max_noise is the full width of the stochastic demand band.
 # Example: if the weekday base demand is 15 and max_noise = 10,
@@ -29,7 +36,10 @@ max_noise = 10
 fit_lambda_to_centered_mean = True
 
 # Output used by the policy scripts.
-output_path = "weekday_demand_probabilities.xlsx"
+if demand_multiplier == 1.00:
+    output_path = "weekday_demand_probabilities.xlsx"
+else:
+    output_path = "weekday_demand_probabilities_plus10.xlsx"
 
 
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]

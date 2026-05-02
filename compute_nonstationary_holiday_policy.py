@@ -24,8 +24,8 @@ DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters.
 SHELF_LIFE = 5
-INVENTORY_CAP = 39
-MAX_ORDER = 30
+INVENTORY_CAP = 50
+MAX_ORDER = 35
 REGULAR_PRODUCTION_DAYS = {0, 1, 2, 3, 4}  # 0=Monday, ..., 6=Sunday
 
 # Costs.
