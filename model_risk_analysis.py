@@ -17,6 +17,10 @@ from compute_average_cost_optimal_policy import (
     DEMAND_SHEET_NAME,
     WEEKDAYS,
     PRINT_TOP_ROWS,
+    C_OUTDATE,
+    C_SHORTAGE,
+    C_HOLDING,
+    C_PRODUCTION,
     # State/action helpers
     State,
     load_demand_probabilities,
@@ -27,6 +31,7 @@ from compute_average_cost_optimal_policy import (
     structurally_feasible_state,
     reachable_state_filter,
     assert_transition_closed,
+    step_dynamics,
     # Optimization/evaluation
     solve_average_cost_lp,
     build_transition_matrix_under_policy,
@@ -195,6 +200,203 @@ def evaluate_policy_under_demand(
     return average_cost_per_day, pi, evaluated_policy_df, compact_df, visited_state_df, weekday_plan_df
 
 
+
+def compute_policy_cost_breakdown_under_demand(
+    states: List[State],
+    det_policy: Dict[State, int],
+    demand_pmf: np.ndarray,
+    stationary_probabilities: np.ndarray,
+    case_name: str,
+    optimized_under_scenario: str,
+    evaluated_under_scenario: str,
+    reference_average_cost_per_day: float | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Decompose the long-run average immediate cost of a fixed policy under a
+    specified demand model.
+
+    The weighting is done with the stationary distribution of the Markov chain
+    induced by the fixed policy under the evaluation demand model.
+    """
+    if len(states) != len(stationary_probabilities):
+        raise ValueError("states and stationary_probabilities must have the same length.")
+
+    units = {
+        "holding": 0.0,
+        "production": 0.0,
+        "outdate": 0.0,
+        "shortage": 0.0,
+    }
+
+    for s, state_probability in zip(states, stationary_probabilities):
+        if state_probability <= 0.0:
+            continue
+
+        day = s[0]
+        action = det_policy[s]
+        probs = demand_pmf[day, :]
+
+        for demand, demand_probability in enumerate(probs):
+            if demand_probability <= 1e-12:
+                continue
+
+            _, shortage, outdate, holding = step_dynamics(
+                state=s,
+                action=action,
+                demand=int(demand),
+                shelf_life=SHELF_LIFE,
+            )
+
+            weight = float(state_probability) * float(demand_probability)
+            units["holding"] += weight * holding
+            units["production"] += weight * float(action)
+            units["outdate"] += weight * outdate
+            units["shortage"] += weight * shortage
+
+    unit_costs = {
+        "holding": C_HOLDING,
+        "production": C_PRODUCTION,
+        "outdate": C_OUTDATE,
+        "shortage": C_SHORTAGE,
+    }
+
+    rows = []
+    component_costs_per_day = {
+        component: units[component] * unit_costs[component]
+        for component in units
+    }
+    total_cost_per_day = float(sum(component_costs_per_day.values()))
+
+    for component in ["holding", "production", "outdate", "shortage"]:
+        avg_units_per_day = float(units[component])
+        avg_cost_per_day = float(component_costs_per_day[component])
+        rows.append({
+            "case": case_name,
+            "optimized_under_scenario": optimized_under_scenario,
+            "evaluated_under_scenario": evaluated_under_scenario,
+            "component": component,
+            "unit_cost": float(unit_costs[component]),
+            "average_units_per_day": avg_units_per_day,
+            "average_units_per_week": 7.0 * avg_units_per_day,
+            "average_cost_per_day": avg_cost_per_day,
+            "average_cost_per_week": 7.0 * avg_cost_per_day,
+            "share_of_case_total_cost": (
+                avg_cost_per_day / total_cost_per_day
+                if abs(total_cost_per_day) > 1e-12 else np.nan
+            ),
+        })
+
+    rows.append({
+        "case": case_name,
+        "optimized_under_scenario": optimized_under_scenario,
+        "evaluated_under_scenario": evaluated_under_scenario,
+        "component": "total_immediate_cost",
+        "unit_cost": np.nan,
+        "average_units_per_day": np.nan,
+        "average_units_per_week": np.nan,
+        "average_cost_per_day": total_cost_per_day,
+        "average_cost_per_week": 7.0 * total_cost_per_day,
+        "share_of_case_total_cost": 1.0,
+    })
+
+    breakdown_df = pd.DataFrame(rows)
+
+    check_df = pd.DataFrame([{
+        "case": case_name,
+        "optimized_under_scenario": optimized_under_scenario,
+        "evaluated_under_scenario": evaluated_under_scenario,
+        "breakdown_total_cost_per_day": total_cost_per_day,
+        "reference_average_cost_per_day": reference_average_cost_per_day,
+        "difference_vs_reference_cost_per_day": (
+            total_cost_per_day - reference_average_cost_per_day
+            if reference_average_cost_per_day is not None else np.nan
+        ),
+    }])
+
+    return breakdown_df, check_df
+
+
+def build_component_difference_table(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    left_case: str,
+    right_case: str,
+    comparison_name: str,
+    difference_label: str,
+) -> pd.DataFrame:
+    """
+    Build component-wise differences between two cost-breakdown cases.
+
+    Difference is always left_case minus right_case.
+    """
+    left = left_df[left_df["case"] == left_case].copy()
+    right = right_df[right_df["case"] == right_case].copy()
+
+    keep_cols = [
+        "component",
+        "unit_cost",
+        "average_units_per_day",
+        "average_units_per_week",
+        "average_cost_per_day",
+        "average_cost_per_week",
+    ]
+
+    merged = left[keep_cols].merge(
+        right[keep_cols],
+        on="component",
+        how="inner",
+        suffixes=("_left", "_right"),
+    )
+
+    rows = []
+    for row in merged.itertuples(index=False):
+        component = row.component
+        left_cost_day = float(row.average_cost_per_day_left)
+        right_cost_day = float(row.average_cost_per_day_right)
+        delta_cost_day = left_cost_day - right_cost_day
+
+        left_units_day = row.average_units_per_day_left
+        right_units_day = row.average_units_per_day_right
+        if pd.isna(left_units_day) or pd.isna(right_units_day):
+            delta_units_day = np.nan
+        else:
+            delta_units_day = float(left_units_day) - float(right_units_day)
+
+        unit_cost_left = row.unit_cost_left
+        unit_cost_right = row.unit_cost_right
+        if pd.isna(unit_cost_left):
+            unit_cost = np.nan
+        elif pd.isna(unit_cost_right) or abs(float(unit_cost_left) - float(unit_cost_right)) <= 1e-12:
+            unit_cost = float(unit_cost_left)
+        else:
+            unit_cost = np.nan
+
+        rows.append({
+            "comparison": comparison_name,
+            "difference_definition": difference_label,
+            "left_case": left_case,
+            "right_case": right_case,
+            "component": component,
+            "unit_cost": unit_cost,
+            "delta_units_per_day": delta_units_day,
+            "delta_units_per_week": 7.0 * delta_units_day if not pd.isna(delta_units_day) else np.nan,
+            "delta_cost_per_day": delta_cost_day,
+            "delta_cost_per_week": 7.0 * delta_cost_day,
+        })
+
+    diff_df = pd.DataFrame(rows)
+    total_delta = diff_df.loc[
+        diff_df["component"] == "total_immediate_cost",
+        "delta_cost_per_day",
+    ]
+    total_delta_value = float(total_delta.iloc[0]) if len(total_delta) else np.nan
+
+    diff_df["share_of_total_delta_cost"] = diff_df["delta_cost_per_day"].apply(
+        lambda x: x / total_delta_value if abs(total_delta_value) > 1e-12 else np.nan
+    )
+
+    return diff_df
+
 def save_policy_plots(policy_df: pd.DataFrame, folder: Path) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     plot_policy_heatmap_avg_order(policy_df, folder / "heatmap_avg_order.png")
@@ -256,7 +458,7 @@ def main() -> None:
     )
 
     # Evaluate assumed policy under assumed demand, mostly as a consistency check.
-    cost_assumed_policy_under_assumed, _, policy_df_assumed_eval_assumed, compact_assumed_eval_assumed, visited_assumed_eval_assumed, weekday_assumed_eval_assumed = evaluate_policy_under_demand(
+    cost_assumed_policy_under_assumed, pi_assumed_policy_under_assumed, policy_df_assumed_eval_assumed, compact_assumed_eval_assumed, visited_assumed_eval_assumed, weekday_assumed_eval_assumed = evaluate_policy_under_demand(
         states=states,
         det_policy=policy_assumed,
         policy_df=policy_df_assumed,
@@ -267,7 +469,7 @@ def main() -> None:
     # 2. Evaluate assumed policy under true demand theta
     # ------------------------------------------------------------
     print("\nEvaluating ASSUMED policy under TRUE demand...")
-    cost_assumed_policy_under_true, _, policy_df_assumed_eval_true, compact_assumed_eval_true, visited_assumed_eval_true, weekday_assumed_eval_true = evaluate_policy_under_demand(
+    cost_assumed_policy_under_true, pi_assumed_policy_under_true, policy_df_assumed_eval_true, compact_assumed_eval_true, visited_assumed_eval_true, weekday_assumed_eval_true = evaluate_policy_under_demand(
         states=states,
         det_policy=policy_assumed,
         policy_df=policy_df_assumed,
@@ -285,7 +487,7 @@ def main() -> None:
         shelf_life=SHELF_LIFE,
     )
 
-    cost_true_policy_under_true, _, policy_df_true_eval_true, compact_true_eval_true, visited_true_eval_true, weekday_true_eval_true = evaluate_policy_under_demand(
+    cost_true_policy_under_true, pi_true_policy_under_true, policy_df_true_eval_true, compact_true_eval_true, visited_true_eval_true, weekday_true_eval_true = evaluate_policy_under_demand(
         states=states,
         det_policy=policy_true,
         policy_df=policy_df_true,
@@ -300,6 +502,75 @@ def main() -> None:
     model_risk_loss_pct = (
         100.0 * model_risk_loss_per_day / cost_true_policy_under_true
         if abs(cost_true_policy_under_true) > 1e-12 else np.nan
+    )
+
+    cost_breakdown_assumed_eval_assumed, cost_breakdown_check_assumed_eval_assumed = compute_policy_cost_breakdown_under_demand(
+        states=states,
+        det_policy=policy_assumed,
+        demand_pmf=assumed_demand_pmf,
+        stationary_probabilities=pi_assumed_policy_under_assumed,
+        case_name="assumed_policy_evaluated_under_assumed_demand",
+        optimized_under_scenario=ASSUMED_SCENARIO_NAME,
+        evaluated_under_scenario=ASSUMED_SCENARIO_NAME,
+        reference_average_cost_per_day=cost_assumed_policy_under_assumed,
+    )
+
+    cost_breakdown_assumed_eval_true, cost_breakdown_check_assumed_eval_true = compute_policy_cost_breakdown_under_demand(
+        states=states,
+        det_policy=policy_assumed,
+        demand_pmf=true_demand_pmf,
+        stationary_probabilities=pi_assumed_policy_under_true,
+        case_name="assumed_policy_evaluated_under_true_demand",
+        optimized_under_scenario=ASSUMED_SCENARIO_NAME,
+        evaluated_under_scenario=TRUE_SCENARIO_NAME,
+        reference_average_cost_per_day=cost_assumed_policy_under_true,
+    )
+
+    cost_breakdown_true_eval_true, cost_breakdown_check_true_eval_true = compute_policy_cost_breakdown_under_demand(
+        states=states,
+        det_policy=policy_true,
+        demand_pmf=true_demand_pmf,
+        stationary_probabilities=pi_true_policy_under_true,
+        case_name="true_policy_evaluated_under_true_demand",
+        optimized_under_scenario=TRUE_SCENARIO_NAME,
+        evaluated_under_scenario=TRUE_SCENARIO_NAME,
+        reference_average_cost_per_day=cost_true_policy_under_true,
+    )
+
+    cost_breakdown_df = pd.concat(
+        [
+            cost_breakdown_assumed_eval_assumed,
+            cost_breakdown_assumed_eval_true,
+            cost_breakdown_true_eval_true,
+        ],
+        ignore_index=True,
+    )
+
+    cost_breakdown_check_df = pd.concat(
+        [
+            cost_breakdown_check_assumed_eval_assumed,
+            cost_breakdown_check_assumed_eval_true,
+            cost_breakdown_check_true_eval_true,
+        ],
+        ignore_index=True,
+    )
+
+    cost_breakdown_model_risk_loss_df = build_component_difference_table(
+        left_df=cost_breakdown_df,
+        right_df=cost_breakdown_df,
+        left_case="assumed_policy_evaluated_under_true_demand",
+        right_case="true_policy_evaluated_under_true_demand",
+        comparison_name="component_wise_model_risk_loss",
+        difference_label="assumed_policy_under_true_demand_minus_true_policy_under_true_demand",
+    )
+
+    cost_breakdown_demand_shift_df = build_component_difference_table(
+        left_df=cost_breakdown_df,
+        right_df=cost_breakdown_df,
+        left_case="assumed_policy_evaluated_under_true_demand",
+        right_case="assumed_policy_evaluated_under_assumed_demand",
+        comparison_name="component_wise_effect_of_true_demand_shift_on_assumed_policy",
+        difference_label="assumed_policy_under_true_demand_minus_assumed_policy_under_assumed_demand",
     )
 
     summary_df = pd.DataFrame({
@@ -324,6 +595,10 @@ def main() -> None:
             "shelf_life",
             "inventory_cap",
             "max_order",
+            "c_outdate",
+            "c_shortage",
+            "c_holding",
+            "c_production",
         ],
         "value": [
             ASSUMED_SCENARIO_NAME,
@@ -346,6 +621,10 @@ def main() -> None:
             SHELF_LIFE,
             INVENTORY_CAP,
             MAX_ORDER,
+            C_OUTDATE,
+            C_SHORTAGE,
+            C_HOLDING,
+            C_PRODUCTION,
         ]
     })
 
@@ -376,6 +655,10 @@ def main() -> None:
     with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
         summary_df.to_excel(writer, sheet_name="ModelRiskSummary", index=False)
         comparison_df.to_excel(writer, sheet_name="CostComparison", index=False)
+        cost_breakdown_df.to_excel(writer, sheet_name="CostBreakdown", index=False)
+        cost_breakdown_model_risk_loss_df.to_excel(writer, sheet_name="CostBreakdown_ModelRiskLoss", index=False)
+        cost_breakdown_demand_shift_df.to_excel(writer, sheet_name="CostBreakdown_DemandShift", index=False)
+        cost_breakdown_check_df.to_excel(writer, sheet_name="CostBreakdown_Checks", index=False)
 
         policy_df_assumed_eval_assumed.to_excel(writer, sheet_name="AssumedPolicy_EvalAssumed", index=False)
         weekday_assumed_eval_assumed.to_excel(writer, sheet_name="Weekday_Assumed_EvalAss", index=False)

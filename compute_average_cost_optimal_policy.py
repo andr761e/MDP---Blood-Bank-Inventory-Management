@@ -344,6 +344,141 @@ def transition_distribution_and_expected_cost(
     return dist, expected_cost
 
 
+
+def expected_cost_components_under_action(
+    state: State,
+    action: int,
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+) -> Dict[str, float]:
+    """
+    Compute expected one-day units and cost components for a fixed state-action pair.
+
+    The expected unit quantities are computed directly from the transition dynamics.
+    This is more robust than recovering them by dividing costs by unit costs, since
+    some unit costs may be set to zero in experiments.
+    """
+    day = state[0]
+    probs = demand_pmf[day, :]
+
+    expected_shortage_units = 0.0
+    expected_outdate_units = 0.0
+    expected_holding_units = 0.0
+
+    for demand, p in enumerate(probs):
+        if p <= 1e-12:
+            continue
+
+        _, shortage, outdate, holding = step_dynamics(
+            state=state,
+            action=action,
+            demand=demand,
+            shelf_life=shelf_life,
+        )
+
+        expected_shortage_units += float(p) * shortage
+        expected_outdate_units += float(p) * outdate
+        expected_holding_units += float(p) * holding
+
+    expected_production_units = float(action)
+
+    return {
+        "holding_units": expected_holding_units,
+        "production_units": expected_production_units,
+        "outdate_units": expected_outdate_units,
+        "shortage_units": expected_shortage_units,
+        "holding_cost": C_HOLDING * expected_holding_units,
+        "production_cost": C_PRODUCTION * expected_production_units,
+        "outdate_cost": C_OUTDATE * expected_outdate_units,
+        "shortage_cost": C_SHORTAGE * expected_shortage_units,
+    }
+
+
+def build_average_cost_breakdown_under_policy(
+    states: List[State],
+    pi: np.ndarray,
+    det_policy: Dict[State, int],
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+) -> tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Compute the long-run average daily cost breakdown under a deterministic policy.
+
+    For each state s, we compute the expected one-day component costs under the
+    policy action pi_policy(s), and then weight by the stationary probability pi(s).
+    """
+    totals = {
+        "holding_units": 0.0,
+        "production_units": 0.0,
+        "outdate_units": 0.0,
+        "shortage_units": 0.0,
+        "holding_cost": 0.0,
+        "production_cost": 0.0,
+        "outdate_cost": 0.0,
+        "shortage_cost": 0.0,
+    }
+
+    for i, state in enumerate(states):
+        state_prob = float(pi[i])
+        if state_prob <= 1e-15:
+            continue
+
+        action = det_policy[state]
+        components = expected_cost_components_under_action(
+            state=state,
+            action=action,
+            demand_pmf=demand_pmf,
+            shelf_life=shelf_life,
+        )
+
+        for key in totals:
+            totals[key] += state_prob * components[key]
+
+    totals["total_cost"] = (
+        totals["holding_cost"]
+        + totals["production_cost"]
+        + totals["outdate_cost"]
+        + totals["shortage_cost"]
+    )
+
+    rows = []
+    component_specs = [
+        ("holding", C_HOLDING, "holding_units", "holding_cost"),
+        ("production", C_PRODUCTION, "production_units", "production_cost"),
+        ("outdate", C_OUTDATE, "outdate_units", "outdate_cost"),
+        ("shortage", C_SHORTAGE, "shortage_units", "shortage_cost"),
+    ]
+
+    for component, unit_cost, units_key, cost_key in component_specs:
+        avg_units_per_day = totals[units_key]
+        avg_cost_per_day = totals[cost_key]
+        rows.append({
+            "component": component,
+            "unit_cost": unit_cost,
+            "average_units_per_day": avg_units_per_day,
+            "average_units_per_week": 7.0 * avg_units_per_day,
+            "average_cost_per_day": avg_cost_per_day,
+            "average_cost_per_week": 7.0 * avg_cost_per_day,
+            "share_of_total_cost": (
+                avg_cost_per_day / totals["total_cost"]
+                if abs(totals["total_cost"]) > 1e-12
+                else np.nan
+            ),
+        })
+
+    rows.append({
+        "component": "total",
+        "unit_cost": np.nan,
+        "average_units_per_day": np.nan,
+        "average_units_per_week": np.nan,
+        "average_cost_per_day": totals["total_cost"],
+        "average_cost_per_week": 7.0 * totals["total_cost"],
+        "share_of_total_cost": 1.0,
+    })
+
+    return pd.DataFrame(rows), totals
+
+
 # ============================================================
 # SOLVE AVERAGE-COST MDP BY DUAL LINEAR PROGRAM
 # ============================================================
@@ -844,6 +979,14 @@ def main():
 
     g_eval = float(np.dot(pi, c_vec))
 
+    cost_breakdown_df, cost_breakdown = build_average_cost_breakdown_under_policy(
+        states=states,
+        pi=pi,
+        det_policy=det_policy,
+        demand_pmf=demand_pmf,
+        shelf_life=SHELF_LIFE,
+    )
+
     run_summary_df = pd.DataFrame({
         "metric": [
             "optimal_average_cost_per_day_from_lp",
@@ -859,6 +1002,7 @@ def main():
             "c_shortage",
             "c_holding",
             "c_production",
+            "component_cost_difference_vs_stationary_distribution",
         ],
         "value": [
             g_star,
@@ -874,12 +1018,14 @@ def main():
             C_SHORTAGE,
             C_HOLDING,
             C_PRODUCTION,
+            cost_breakdown["total_cost"] - g_eval,
         ]
     })
 
     # Save everything
     with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
         run_summary_df.to_excel(writer, sheet_name="RunSummary", index=False)
+        cost_breakdown_df.to_excel(writer, sheet_name="CostBreakdown", index=False)
         policy_df.to_excel(writer, sheet_name="OptimalPolicy_AllStates", index=False)
         compact_df.to_excel(writer, sheet_name="CompactSummary", index=False)
         weekday_plan_df.to_excel(writer, sheet_name="WeekdayPlan", index=False)

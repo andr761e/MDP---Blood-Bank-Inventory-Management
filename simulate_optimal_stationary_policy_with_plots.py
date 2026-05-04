@@ -314,20 +314,32 @@ def step_dynamics_detailed(
     next_state = (next_day,) + next_inv
     holding = float(sum(next_inv))
 
+    production = float(action)
+
+    production_cost = C_PRODUCTION * production
+    shortage_cost = C_SHORTAGE * shortage
+    outdate_cost = C_OUTDATE * outdate
+    holding_cost = C_HOLDING * holding
+
     period_cost = (
-        C_OUTDATE * outdate
-        + C_SHORTAGE * shortage
-        + C_HOLDING * holding
-        + C_PRODUCTION * action
+        outdate_cost
+        + shortage_cost
+        + holding_cost
+        + production_cost
     )
 
     return {
         "next_state": next_state,
         "stock_before_issue": tuple(stock_before_issue),
         "fifo_used": tuple(fifo_used),
+        "production_units": production,
         "shortage": shortage,
         "outdate": outdate,
         "holding_next_morning": holding,
+        "production_cost": production_cost,
+        "shortage_cost": shortage_cost,
+        "outdate_cost": outdate_cost,
+        "holding_cost": holding_cost,
         "period_cost": period_cost,
     }
 
@@ -466,9 +478,14 @@ def simulate_one_path(
             "order": action,
             "demand": demand,
             "stock_before_issue": str(details["stock_before_issue"]),
+            "production_units": details["production_units"],
             "shortage": details["shortage"],
             "outdate": details["outdate"],
             "holding_next_morning": details["holding_next_morning"],
+            "production_cost": details["production_cost"],
+            "shortage_cost": details["shortage_cost"],
+            "outdate_cost": details["outdate_cost"],
+            "holding_cost": details["holding_cost"],
             "state_after": str(next_state),
             "period_cost": details["period_cost"],
         }
@@ -528,6 +545,110 @@ def build_replication_summary(replication_results: List[pd.DataFrame]) -> pd.Dat
             "avg_outdate_per_day": sim_df["outdate"].mean(),
         })
     return pd.DataFrame(rows)
+
+
+def build_cost_breakdown(replication_results: List[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Build a realized cost breakdown for the simulated paths.
+
+    Unlike the LP-based CostBreakdown, this is based on the actually simulated
+    demand path(s). Therefore the total columns are concrete realized totals.
+    Per-week values are normalized as 7 times the per-day average, which avoids
+    giving a distorted average if SIMULATION_DAYS is not a multiple of 7.
+    """
+    component_specs = [
+        {
+            "component": "holding",
+            "unit_cost": C_HOLDING,
+            "units_col": "holding_next_morning",
+            "cost_col": "holding_cost",
+        },
+        {
+            "component": "production",
+            "unit_cost": C_PRODUCTION,
+            "units_col": "production_units",
+            "cost_col": "production_cost",
+        },
+        {
+            "component": "outdate",
+            "unit_cost": C_OUTDATE,
+            "units_col": "outdate",
+            "cost_col": "outdate_cost",
+        },
+        {
+            "component": "shortage",
+            "unit_cost": C_SHORTAGE,
+            "units_col": "shortage",
+            "cost_col": "shortage_cost",
+        },
+    ]
+
+    rows = []
+
+    for replication, sim_df in enumerate(replication_results, start=1):
+        n_days = len(sim_df)
+        if n_days == 0:
+            raise ValueError("Cannot build CostBreakdown for an empty simulation path.")
+
+        total_cost = float(sim_df["period_cost"].sum())
+
+        for spec in component_specs:
+            total_units = float(sim_df[spec["units_col"]].sum())
+            component_cost = float(sim_df[spec["cost_col"]].sum())
+            units_per_day = total_units / n_days
+            cost_per_day = component_cost / n_days
+
+            rows.append({
+                "replication": replication,
+                "component": spec["component"],
+                "unit_cost": spec["unit_cost"],
+                "total_units": total_units,
+                "average_units_per_day": units_per_day,
+                "average_units_per_week": 7.0 * units_per_day,
+                "total_cost": component_cost,
+                "average_cost_per_day": cost_per_day,
+                "average_cost_per_week": 7.0 * cost_per_day,
+                "share_of_total_cost": component_cost / total_cost if total_cost > 0 else np.nan,
+                "simulation_days": n_days,
+            })
+
+        rows.append({
+            "replication": replication,
+            "component": "total_immediate_cost",
+            "unit_cost": np.nan,
+            "total_units": np.nan,
+            "average_units_per_day": np.nan,
+            "average_units_per_week": np.nan,
+            "total_cost": total_cost,
+            "average_cost_per_day": total_cost / n_days,
+            "average_cost_per_week": 7.0 * total_cost / n_days,
+            "share_of_total_cost": 1.0 if total_cost > 0 else np.nan,
+            "simulation_days": n_days,
+        })
+
+    breakdown_df = pd.DataFrame(rows)
+
+    if len(replication_results) > 1:
+        numeric_cols = [
+            "unit_cost",
+            "total_units",
+            "average_units_per_day",
+            "average_units_per_week",
+            "total_cost",
+            "average_cost_per_day",
+            "average_cost_per_week",
+            "share_of_total_cost",
+            "simulation_days",
+        ]
+        mean_rows = (
+            breakdown_df
+            .groupby("component", as_index=False)[numeric_cols]
+            .mean(numeric_only=True)
+        )
+        mean_rows.insert(0, "replication", "mean_across_replications")
+        breakdown_df = pd.concat([breakdown_df, mean_rows], ignore_index=True)
+
+    return breakdown_df
 
 
 # ============================================================
@@ -916,7 +1037,10 @@ def main():
                 plot_weekday_shortage_outdate_counts(sim_df, PLOTS_DIR / "path1_weekday_shortage_outdate_counts.png")
 
         replication_summary_df = build_replication_summary(replication_results)
+        cost_breakdown_df = build_cost_breakdown(replication_results)
+
         replication_summary_df.to_excel(writer, sheet_name="ReplicationSummary", index=False)
+        cost_breakdown_df.to_excel(writer, sheet_name="CostBreakdown", index=False)
 
     plot_replication_average_costs(replication_summary_df, PLOTS_DIR / "replication_avg_costs.png")
 

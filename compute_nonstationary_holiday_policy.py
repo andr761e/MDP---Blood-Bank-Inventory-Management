@@ -809,6 +809,106 @@ def compute_finite_horizon_occupancy_probabilities(
 
     return occupancy, occupancy_df
 
+
+# ============================================================
+# COST BREAKDOWN UNDER NON-STATIONARY POLICY
+# ============================================================
+
+def compute_nonstationary_cost_breakdown(
+    policy: Dict[tuple[int, State], int],
+    occupancy: Dict[tuple[int, State], float],
+    stage_demand_pmfs: List[np.ndarray],
+) -> pd.DataFrame:
+    """
+    Decompose the expected immediate cost over the finite horizon.
+
+    Unlike the stationary model, the non-stationary model has no stationary
+    distribution. Therefore each stage is weighted by the time-dependent
+    occupancy probability P(X_t = s) under the selected initial distribution
+    and the computed non-stationary policy.
+
+    The terminal continuation value is deliberately not included here, because
+    it is a relative value from the stationary model and cannot be decomposed
+    into holding, production, outdating and shortage costs for this finite
+    horizon.
+    """
+    total_units = {
+        "holding": 0.0,
+        "production": 0.0,
+        "outdate": 0.0,
+        "shortage": 0.0,
+    }
+
+    for (t, state), state_prob in occupancy.items():
+        if t >= HORIZON_DAYS or state_prob <= 0.0:
+            continue
+
+        action = policy[(t, state)]
+        demand_probs = stage_demand_pmfs[t]
+
+        # Production is deterministic conditional on the state and stage.
+        total_units["production"] += state_prob * float(action)
+
+        for demand, demand_prob in enumerate(demand_probs):
+            if demand_prob <= DEMAND_SUPPORT_TOL:
+                continue
+
+            _, shortage, outdate, holding = step_dynamics(
+                state=state,
+                action=action,
+                demand=demand,
+                shelf_life=SHELF_LIFE,
+            )
+
+            probability_weight = state_prob * float(demand_prob)
+            total_units["holding"] += probability_weight * holding
+            total_units["outdate"] += probability_weight * outdate
+            total_units["shortage"] += probability_weight * shortage
+
+    unit_costs = {
+        "holding": C_HOLDING,
+        "production": C_PRODUCTION,
+        "outdate": C_OUTDATE,
+        "shortage": C_SHORTAGE,
+    }
+
+    total_costs = {
+        component: total_units[component] * unit_costs[component]
+        for component in total_units
+    }
+    grand_total_cost = sum(total_costs.values())
+
+    rows = []
+    for component in ["holding", "production", "outdate", "shortage"]:
+        units = total_units[component]
+        cost = total_costs[component]
+        rows.append({
+            "component": component,
+            "unit_cost": unit_costs[component],
+            "expected_total_units_over_horizon": units,
+            "average_units_per_day": units / HORIZON_DAYS,
+            "average_units_per_week": 7.0 * units / HORIZON_DAYS,
+            "expected_total_cost_over_horizon": cost,
+            "average_cost_per_day": cost / HORIZON_DAYS,
+            "average_cost_per_week": 7.0 * cost / HORIZON_DAYS,
+            "share_of_total_immediate_cost": (cost / grand_total_cost) if grand_total_cost > 0 else np.nan,
+        })
+
+    rows.append({
+        "component": "total_immediate_cost",
+        "unit_cost": np.nan,
+        "expected_total_units_over_horizon": np.nan,
+        "average_units_per_day": np.nan,
+        "average_units_per_week": np.nan,
+        "expected_total_cost_over_horizon": grand_total_cost,
+        "average_cost_per_day": grand_total_cost / HORIZON_DAYS,
+        "average_cost_per_week": 7.0 * grand_total_cost / HORIZON_DAYS,
+        "share_of_total_immediate_cost": 1.0 if grand_total_cost > 0 else np.nan,
+    })
+
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # OUTPUT HELPERS
 # ============================================================
@@ -1566,6 +1666,12 @@ def main():
         stage_demand_pmfs=stage_demand_pmfs,
     )
 
+    cost_breakdown_df = compute_nonstationary_cost_breakdown(
+        policy=policy,
+        occupancy=occupancy,
+        stage_demand_pmfs=stage_demand_pmfs,
+    )
+
     run_summary_df = pd.DataFrame({
         "metric": [
             "stationary_average_cost_per_day_terminal_model",
@@ -1613,6 +1719,7 @@ def main():
 
     with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
         run_summary_df.to_excel(writer, sheet_name="RunSummary", index=False)
+        cost_breakdown_df.to_excel(writer, sheet_name="CostBreakdown", index=False)
         calendar_df.to_excel(writer, sheet_name="Calendar", index=False)
         state_count_df.to_excel(writer, sheet_name="StateCounts", index=False)
         stage_summary_df.to_excel(writer, sheet_name="StageSummary", index=False)
@@ -1645,6 +1752,9 @@ def main():
 
     print("\nTOP POLICY ROWS")
     print(policy_df.head(PRINT_TOP_ROWS).to_string(index=False))
+
+    print("\nCOST BREAKDOWN")
+    print(cost_breakdown_df.to_string(index=False))
 
     print("\nSaved detailed outputs to:")
     print(f"  {OUTPUT_XLSX_PATH}")
