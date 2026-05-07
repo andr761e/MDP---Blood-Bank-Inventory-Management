@@ -29,14 +29,15 @@ MAX_ORDER = 35
 REGULAR_PRODUCTION_DAYS = {0, 1, 2, 3, 4}  # 0=Monday, ..., 6=Sunday
 
 # Costs.
-C_OUTDATE = 2500.0
+C_OUTDATE = 2410.0
 C_SHORTAGE = 20000.0
 C_HOLDING = 5.0
-C_PRODUCTION = 2500.0
+C_PRODUCTION = 2410.0
 
-# Output files.
-OUTPUT_XLSX_PATH = Path("data/optimal_nonstationary_christmas_policy.xlsx")
-PLOTS_DIR = Path("data/nonstationary_policy_plots")
+# Output folders/files.
+OUTPUT_DIR = Path("data/Non-stationary")
+OUTPUT_XLSX_PATH = OUTPUT_DIR / "optimal_nonstationary_christmas_policy.xlsx"
+PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 
 # Numerical tolerances.
 REDUCED_COST_TOL = 1e-8
@@ -54,7 +55,7 @@ HORIZON_DAYS = 21
 HOLIDAYS = {
     date(YEAR, 12, 24): "Christmas Eve",
     date(YEAR, 12, 25): "Christmas Day",
-    #date(YEAR, 12, 26): "Boxing Day",
+    date(YEAR, 12, 26): "Boxing Day",
     date(YEAR + 1, 1, 1): "New Year's Day",
 }
 
@@ -66,12 +67,14 @@ HOLIDAYS = {
 #   "weekend_mean" -> use the average of Saturday and Sunday distributions.
 HOLIDAY_DEMAND_MODE = "weekend_mean"
 
-# Initial states for the finite-horizon model.
+# Initial distribution for the finite-horizon model.
 # Options:
-#   "empty"                    -> start from the empty state only.
-#   "all_stationary_start_day" -> start from all states with the correct start weekday
-#                                  that are reachable under the regular stationary model.
-INITIAL_STATE_MODE = "all_stationary_start_day"
+#   "stationary_start_day_distribution"
+#       -> start from the stationary distribution of the regular weekly model,
+#          conditional on the start weekday. This is the recommended setting.
+#   "empty"
+#       -> start from the empty state only. Useful for debugging, but usually not realistic.
+INITIAL_STATE_MODE = "stationary_start_day_distribution"
 
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -595,6 +598,90 @@ def solve_stationary_average_cost_lp_for_terminal_values(
     return g_star, h_star, det_policy
 
 
+
+
+def propagate_distribution_one_step_regular(
+    current_dist: Dict[State, float],
+    policy: Dict[State, int],
+    demand_pmf: np.ndarray,
+) -> Dict[State, float]:
+    """Propagate a state distribution one ordinary stationary day forward."""
+    next_dist: Dict[State, float] = {}
+
+    for state, state_prob in current_dist.items():
+        if state_prob <= 0.0:
+            continue
+
+        action = policy[state]
+        demand_probs = demand_pmf[state[0], :]
+        transition_dist, _ = transition_distribution_and_expected_cost_from_probs(
+            state=state,
+            action=action,
+            demand_probs=demand_probs,
+            shelf_life=SHELF_LIFE,
+        )
+
+        for next_state, trans_prob in transition_dist.items():
+            next_dist[next_state] = next_dist.get(next_state, 0.0) + state_prob * trans_prob
+
+    total = sum(next_dist.values())
+    if total <= 0:
+        raise ValueError("Distribution vanished during stationary propagation.")
+
+    return {s: p / total for s, p in next_dist.items()}
+
+
+def compute_stationary_start_day_distribution(
+    states: List[State],
+    demand_pmf: np.ndarray,
+    policy: Dict[State, int],
+    start_weekday: int,
+    tol: float = 1e-13,
+    max_weeks: int = 5000,
+) -> Dict[State, float]:
+    """
+    Compute the regular stationary distribution conditional on the start weekday.
+
+    The weekly model is periodic because the weekday advances deterministically.
+    Instead of solving for a full stationary distribution over all weekdays, this
+    function iterates the 7-day transition kernel on the states belonging to the
+    chosen start weekday. The resulting distribution is the appropriate initial
+    distribution for a finite-horizon scenario that begins during normal operation.
+    """
+    weekday_states = [s for s in states if s[0] == start_weekday]
+    if not weekday_states:
+        raise ValueError(f"No stationary states found for weekday index {start_weekday}.")
+
+    current_dist: Dict[State, float] = {s: 1.0 / len(weekday_states) for s in weekday_states}
+
+    for week in range(max_weeks):
+        old_dist = current_dist
+        new_dist = current_dist
+
+        for _ in range(7):
+            new_dist = propagate_distribution_one_step_regular(new_dist, policy, demand_pmf)
+
+        keys = set(old_dist) | set(new_dist)
+        diff = sum(abs(new_dist.get(s, 0.0) - old_dist.get(s, 0.0)) for s in keys)
+        current_dist = new_dist
+
+        if diff < tol:
+            break
+    else:
+        print(
+            f"Warning: stationary start-day distribution did not fully converge "
+            f"after {max_weeks} weeks. Last L1 difference = {diff:.3e}"
+        )
+
+    # Remove numerical dust and renormalize.
+    current_dist = {s: p for s, p in current_dist.items() if p > tol}
+    total = sum(current_dist.values())
+    if total <= 0:
+        raise ValueError("Stationary start-day distribution has no positive support.")
+
+    return {s: p / total for s, p in current_dist.items()}
+
+
 # ============================================================
 # NON-STATIONARY STATE FILTERS
 # ============================================================
@@ -740,51 +827,57 @@ def compute_finite_horizon_occupancy_probabilities(
     policy: Dict[tuple[int, State], int],
     calendar_df: pd.DataFrame,
     stage_demand_pmfs: List[np.ndarray],
-    initial_states: List[State],
+    initial_distribution: Dict[State, float],
 ) -> tuple[Dict[tuple[int, State], float], pd.DataFrame]:
     """
-    Computes time-dependent state probabilities under the non-stationary policy.
+    Compute time-dependent occupancy probabilities under the non-stationary policy.
 
-    This is NOT a stationary distribution.
-    It is the probability of being in state s at stage t under the chosen initial distribution.
+    This is NOT a stationary distribution. It is the distribution
+    P(X_t = s) at each stage t under the selected initial distribution and the
+    finite-horizon policy.
     """
-
     occupancy: Dict[tuple[int, State], float] = {}
 
-    # Simple default: uniform distribution over initial states.
-    # Later we can improve this by using the stationary distribution conditional on start weekday.
-    initial_states = [s for s in initial_states if s in set(reachable_by_t[0])]
+    reachable_start = set(reachable_by_t[0])
+    current_dist = {
+        s: p for s, p in initial_distribution.items()
+        if s in reachable_start and p > 0.0
+    }
 
-    if not initial_states:
-        raise ValueError("No valid initial states for occupancy computation.")
+    if not current_dist:
+        raise ValueError("No positive-probability initial states survived the finite-horizon filters.")
 
-    initial_prob = 1.0 / len(initial_states)
-
-    current_dist = {s: initial_prob for s in initial_states}
+    total_initial_mass = sum(current_dist.values())
+    current_dist = {s: p / total_initial_mass for s, p in current_dist.items()}
 
     for s, p in current_dist.items():
         occupancy[(0, s)] = p
 
     for t in range(HORIZON_DAYS):
         next_dist: Dict[State, float] = {}
-
         demand_probs = stage_demand_pmfs[t]
 
         for s, state_prob in current_dist.items():
-            if state_prob <= 0:
+            if state_prob <= 0.0:
                 continue
 
-            a = policy[(t, s)]
-
+            action = policy[(t, s)]
             transition_dist, _ = transition_distribution_and_expected_cost_from_probs(
                 state=s,
-                action=a,
+                action=action,
                 demand_probs=demand_probs,
                 shelf_life=SHELF_LIFE,
             )
 
             for ns, trans_prob in transition_dist.items():
                 next_dist[ns] = next_dist.get(ns, 0.0) + state_prob * trans_prob
+
+        total_mass = sum(next_dist.values())
+        if total_mass <= 0:
+            raise ValueError(f"Occupancy distribution vanished at stage {t + 1}.")
+
+        # Renormalize to avoid tiny floating point drift.
+        next_dist = {s: p / total_mass for s, p in next_dist.items()}
 
         for ns, p in next_dist.items():
             occupancy[(t + 1, ns)] = p
@@ -806,7 +899,6 @@ def compute_finite_horizon_occupancy_probabilities(
             rows.append(row)
 
     occupancy_df = pd.DataFrame(rows)
-
     return occupancy, occupancy_df
 
 
@@ -981,11 +1073,10 @@ def build_terminal_state_table(terminal_states: List[State], terminal_h: Dict[St
 
 
 # ============================================================
-# PLOT HELPERS
+# PLOT AND POLICY-SUMMARY HELPERS
 # ============================================================
 
 def _format_stage_axis(ax, calendar_df: pd.DataFrame) -> None:
-    """Common x-axis formatting for horizon plots."""
     x = calendar_df["t"].to_numpy()
     labels = [
         f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
@@ -997,7 +1088,6 @@ def _format_stage_axis(ax, calendar_df: pd.DataFrame) -> None:
 
 
 def _shade_nonproduction_days(ax, calendar_df: pd.DataFrame) -> None:
-    """Lightly mark days with no production. Holidays get a vertical line as well."""
     for row in calendar_df.itertuples(index=False):
         if not bool(row.can_produce):
             ax.axvspan(row.t - 0.5, row.t + 0.5, alpha=0.12)
@@ -1006,91 +1096,395 @@ def _shade_nonproduction_days(ax, calendar_df: pd.DataFrame) -> None:
 
 
 def add_policy_plot_columns(policy_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add columns that make plotting and grouping easier.
-    This keeps the plotting functions independent of how the policy was exported.
-    """
     df = policy_df.copy()
     age_cols = [f"x{i + 1}" for i in range(SHELF_LIFE - 1)]
     df["total_stock"] = df[age_cols].sum(axis=1)
-    df["old_stock"] = df["x1"]
-    df["young_stock"] = df[f"x{SHELF_LIFE - 1}"]
-    df["pre_action_inventory"] = df["total_stock"] + df["optimal_order"]
+    df["post_order_stock"] = df["total_stock"] + df["optimal_order"]
     return df
 
 
-def plot_average_order_by_stage(
-    policy_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    """Plot min/mean/max optimal order over reachable states at each stage."""
+def build_occupancy_weighted_stage_summary(policy_df: pd.DataFrame, calendar_df: pd.DataFrame) -> pd.DataFrame:
     df = add_policy_plot_columns(policy_df)
+    rows = []
+
+    for t in range(HORIZON_DAYS):
+        tmp = df[df["t"] == t].copy()
+        row_cal = calendar_df.loc[t]
+        mass = float(tmp["occupancy_probability"].sum())
+
+        if mass > 0:
+            weights = tmp["occupancy_probability"] / mass
+            expected_order = float((weights * tmp["optimal_order"]).sum())
+            expected_stock = float((weights * tmp["total_stock"]).sum())
+            expected_post_order_stock = float((weights * tmp["post_order_stock"]).sum())
+
+            order_mass = tmp.groupby("optimal_order")["occupancy_probability"].sum() / mass
+            most_likely_order = int(order_mass.idxmax())
+            most_likely_order_prob = float(order_mass.max())
+
+            s1_mass = tmp.groupby("post_order_stock")["occupancy_probability"].sum() / mass
+            dominant_s1 = int(s1_mass.idxmax())
+            dominant_s1_prob = float(s1_mass.max())
+        else:
+            expected_order = np.nan
+            expected_stock = np.nan
+            expected_post_order_stock = np.nan
+            most_likely_order = np.nan
+            most_likely_order_prob = np.nan
+            dominant_s1 = np.nan
+            dominant_s1_prob = np.nan
+
+        rows.append({
+            "t": t,
+            "date": row_cal["date"],
+            "weekday": row_cal["weekday"],
+            "is_holiday": bool(row_cal["is_holiday"]),
+            "holiday_name": row_cal["holiday_name"],
+            "can_produce": bool(row_cal["can_produce"]),
+            "occupancy_mass": mass,
+            "expected_start_stock": expected_stock,
+            "expected_order": expected_order,
+            "expected_post_order_stock": expected_post_order_stock,
+            "most_likely_order": most_likely_order,
+            "most_likely_order_probability": most_likely_order_prob,
+            "dominant_post_order_stock_S1": dominant_s1,
+            "dominant_S1_probability": dominant_s1_prob,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_initial_distribution_table(initial_distribution: Dict[State, float]) -> pd.DataFrame:
+    rows = []
+    for s, p in initial_distribution.items():
+        row = {
+            "weekday": WEEKDAYS[s[0]],
+            "total_stock": sum(s[1:]),
+            "initial_probability": p,
+        }
+        for i in range(SHELF_LIFE - 1):
+            row[f"x{i + 1}"] = s[i + 1]
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("initial_probability", ascending=False)
+
+
+def _integerize_scaled_probabilities(probs: pd.Series, scale: int) -> pd.Series:
+    """
+    Convert probabilities to integer frequencies summing exactly to ``scale``.
+
+    Important implementation detail:
+    the index of ``probs`` may consist of tuple keys such as ``(S_1, x)``.
+    Pandas interprets tuple keys as multi-axis indexers when using ``.loc`` on
+    some Series, which can raise ``IndexingError: Too many indexers``.
+    Therefore, the rounding adjustment is done positionally with NumPy arrays,
+    and the original index is restored at the end.
+    """
+    values = probs.astype(float).to_numpy()
+    raw = values * scale
+    floors = np.floor(raw).astype(int)
+
+    remainder = int(scale - floors.sum())
+    fractional = raw - floors
+
+    if remainder > 0:
+        # Add one to the largest fractional remainders.
+        order = np.argsort(-fractional)
+        for pos in order[:remainder]:
+            floors[pos] += 1
+    elif remainder < 0:
+        # Remove one from the smallest fractional remainders, but never below zero.
+        order = np.argsort(fractional)
+        removed = 0
+        for pos in order:
+            if floors[pos] > 0:
+                floors[pos] -= 1
+                removed += 1
+                if removed == abs(remainder):
+                    break
+
+    return pd.Series(floors.astype(int), index=probs.index)
+
+
+def build_frequency_table_for_stage(
+    policy_df: pd.DataFrame,
+    t: int,
+    scale: int = 1_000_000,
+    min_mass: float = 1e-12,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build a book-style state-action frequency table for one stage.
+
+    Columns are pre-order total stock x.
+    Rows are post-order stock S_1 = x + a.
+    Entries are occupancy probabilities scaled to `scale` observations.
+    """
+    df = add_policy_plot_columns(policy_df)
+    tmp = df[(df["t"] == t) & (df["occupancy_probability"] > min_mass)].copy()
+
+    if tmp.empty:
+        raise ValueError(f"No positive occupancy probability at stage {t}.")
+
+    total_mass = float(tmp["occupancy_probability"].sum())
+    tmp["conditional_probability"] = tmp["occupancy_probability"] / total_mass
+
     grouped = (
-        df.groupby("t")["optimal_order"]
-        .agg(min_order="min", mean_order="mean", max_order="max")
-        .reset_index()
+        tmp.groupby(["post_order_stock", "total_stock"], as_index=False)["conditional_probability"]
+        .sum()
     )
 
-    fig, ax = plt.subplots(figsize=(13, 5))
-    ax.plot(grouped["t"], grouped["mean_order"], marker="o", label="Mean optimal order")
-    ax.plot(grouped["t"], grouped["min_order"], marker="v", linestyle="--", label="Minimum")
-    ax.plot(grouped["t"], grouped["max_order"], marker="^", linestyle="--", label="Maximum")
-    _shade_nonproduction_days(ax, calendar_df)
-    _format_stage_axis(ax, calendar_df)
-    ax.set_title("Non-stationary policy: optimal order by stage")
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Optimal order")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
+    keys = list(zip(grouped["post_order_stock"], grouped["total_stock"]))
+    scaled = _integerize_scaled_probabilities(
+        pd.Series(grouped["conditional_probability"].to_numpy(), index=keys),
+        scale,
+    )
+
+    long_rows = []
+    for (s1, x), freq in scaled.items():
+        if freq <= 0:
+            continue
+        long_rows.append({
+            "t": t,
+            "total_stock": int(x),
+            "post_order_stock_S1": int(s1),
+            "frequency": int(freq),
+            "probability": int(freq) / scale,
+        })
+
+    long_df = pd.DataFrame(long_rows)
+
+    x_values = sorted(long_df["total_stock"].unique())
+    s_values = sorted(long_df["post_order_stock_S1"].unique(), reverse=True)
+
+    matrix = long_df.pivot(
+        index="post_order_stock_S1",
+        columns="total_stock",
+        values="frequency",
+    ).reindex(index=s_values, columns=x_values).fillna(0).astype(int)
+
+    table_rows = []
+    header = ["Stock x"] + x_values + ["Freq(S_1)"]
+    table_rows.append(header)
+    table_rows.append(["Up-to S_1"] + [""] * len(x_values) + [""])
+
+    for s1 in s_values:
+        row_vals = []
+        for x in x_values:
+            val = int(matrix.loc[s1, x])
+            row_vals.append("" if val == 0 else val)
+        table_rows.append([s1] + row_vals + [int(matrix.loc[s1].sum())])
+
+    col_totals = matrix.sum(axis=0).astype(int)
+    table_rows.append(["Freq(x)"] + [int(col_totals.loc[x]) for x in x_values] + [int(matrix.values.sum())])
+
+    table_df = pd.DataFrame(table_rows)
+    return table_df, long_df
 
 
-def plot_reachable_state_counts(
-    state_count_df: pd.DataFrame,
+def build_all_frequency_tables(
+    policy_df: pd.DataFrame,
     calendar_df: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    """Plot structural vs reachability filtered state counts for each stage."""
-    fig, ax = plt.subplots(figsize=(13, 5))
-    ax.plot(
-        state_count_df["t"],
-        state_count_df["candidate_states_after_structural_filter"],
-        marker="o",
-        label="After structural filter",
+    scale: int = 1_000_000,
+) -> tuple[Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+    table_by_sheet: Dict[str, pd.DataFrame] = {}
+    long_tables = []
+    summary_rows = []
+
+    df = add_policy_plot_columns(policy_df)
+
+    for row in calendar_df.itertuples(index=False):
+        t = int(row.t)
+        if not bool(row.can_produce):
+            continue
+
+        table_df, long_df = build_frequency_table_for_stage(df, t=t, scale=scale)
+        long_df["date"] = row.date
+        long_df["weekday"] = row.weekday
+        long_df["holiday_name"] = row.holiday_name
+        long_tables.append(long_df)
+
+        s1_summary = (
+            long_df.groupby("post_order_stock_S1")["frequency"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        dominant_s1 = int(s1_summary.index[0])
+        dominant_freq = int(s1_summary.iloc[0])
+
+        tmp = df[(df["t"] == t) & (df["occupancy_probability"] > 1e-12)].copy()
+        mass = float(tmp["occupancy_probability"].sum())
+        expected_order = float((tmp["occupancy_probability"] * tmp["optimal_order"]).sum() / mass)
+        expected_stock = float((tmp["occupancy_probability"] * tmp["total_stock"]).sum() / mass)
+
+        summary_rows.append({
+            "t": t,
+            "date": row.date,
+            "weekday": row.weekday,
+            "holiday_name": row.holiday_name,
+            "dominant_post_order_stock_S1": dominant_s1,
+            "dominant_S1_frequency": dominant_freq,
+            "dominant_S1_share": dominant_freq / scale,
+            "expected_start_stock": expected_stock,
+            "expected_order": expected_order,
+        })
+
+        sheet_name = f"Freq_t{t:02d}_{str(row.weekday)[:3]}"
+        table_by_sheet[sheet_name] = table_df
+
+    frequency_long_df = pd.concat(long_tables, ignore_index=True) if long_tables else pd.DataFrame()
+    dominant_summary_df = pd.DataFrame(summary_rows)
+    return table_by_sheet, frequency_long_df, dominant_summary_df
+
+
+def plot_frequency_table_image(table_df: pd.DataFrame, title: str, output_path: Path) -> None:
+    """Save a simple PNG rendering of one book-style frequency table."""
+    ncols = table_df.shape[1]
+    nrows = table_df.shape[0]
+    fig_width = max(10, 0.55 * ncols)
+    fig_height = max(2.5, 0.35 * nrows + 1.2)
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+    ax.set_title(title, fontsize=12, pad=10)
+
+    table = ax.table(
+        cellText=table_df.astype(str).values,
+        loc="center",
+        cellLoc="center",
     )
-    ax.plot(
-        state_count_df["t"],
-        state_count_df["states_after_reachability_filter"],
-        marker="s",
-        label="After reachability filter",
-    )
-    _shade_nonproduction_days(ax, calendar_df)
-    _format_stage_axis(ax, calendar_df)
-    ax.set_title("Finite-horizon state-space reduction")
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Number of states")
-    ax.legend()
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.25)
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
 
 
-def plot_order_heatmap_by_total_stock(
+def generate_frequency_table_plots(
+    frequency_tables: Dict[str, pd.DataFrame],
+    calendar_df: pd.DataFrame,
+    plots_dir: Path = PLOTS_DIR,
+) -> Dict[str, Path]:
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    paths = {}
+
+    for sheet_name, table_df in frequency_tables.items():
+        # Sheet name is Freq_tXX_Day.
+        t = int(sheet_name.split("_")[1][1:])
+        row = calendar_df.loc[t]
+        title = f"(State, action)-frequency table for 1,000,000 stage-{t} {row['weekday']}s"
+        path = plots_dir / f"frequency_table_t{t:02d}_{str(row['weekday']).lower()}.png"
+        plot_frequency_table_image(table_df, title, path)
+        paths[f"frequency_table_t{t:02d}"] = path
+
+    return paths
+
+
+def plot_occupancy_probability_heatmap(
     policy_df: pd.DataFrame,
     calendar_df: pd.DataFrame,
     output_path: Path,
 ) -> None:
-    """
-    Heatmap of average optimal order by stage and total stock.
-    This is usually the most useful first visualization of the policy structure.
-    """
+    df = add_policy_plot_columns(policy_df)
+    heat = (
+        df.groupby(["total_stock", "t"])["occupancy_probability"]
+        .sum()
+        .unstack("t")
+        .reindex(columns=range(HORIZON_DAYS), fill_value=0.0)
+        .sort_index(ascending=False)
+    )
+
+    fig, ax = plt.subplots(figsize=(13, 8))
+    image = ax.imshow(heat.to_numpy(), aspect="auto")
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label("Occupancy probability")
+
+    ax.set_title("Occupancy probability mass by stage and total stock")
+    ax.set_xlabel("Stage / date")
+    ax.set_ylabel("Total inventory at start of day")
+
+    labels = [
+        f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
+        for row in calendar_df.itertuples(index=False)
+    ]
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_yticks(range(len(heat.index)))
+    ax.set_yticklabels([str(i) for i in heat.index], fontsize=8)
+
+    for row in calendar_df.itertuples(index=False):
+        if not bool(row.can_produce):
+            ax.axvline(row.t, linewidth=2.0, alpha=0.35)
+        if bool(row.is_holiday):
+            ax.axvline(row.t, linestyle="--", linewidth=1.0, alpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_weighted_order_heatmap_by_total_stock(
+    policy_df: pd.DataFrame,
+    calendar_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    df = add_policy_plot_columns(policy_df)
+    rows = []
+
+    for (stock, t), tmp in df.groupby(["total_stock", "t"]):
+        mass = float(tmp["occupancy_probability"].sum())
+        if mass <= 0.0:
+            continue
+        avg_order = float((tmp["occupancy_probability"] * tmp["optimal_order"]).sum() / mass)
+        rows.append({"total_stock": stock, "t": t, "weighted_average_order": avg_order})
+
+    heat_df = pd.DataFrame(rows)
+    heat = (
+        heat_df.pivot(index="total_stock", columns="t", values="weighted_average_order")
+        .reindex(columns=range(HORIZON_DAYS))
+        .sort_index(ascending=False)
+    )
+
+    fig, ax = plt.subplots(figsize=(13, 8))
+    image = ax.imshow(heat.to_numpy(), aspect="auto")
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label("Weighted average optimal order")
+
+    ax.set_title("Occupancy-weighted average optimal order by stage and total stock")
+    ax.set_xlabel("Stage / date")
+    ax.set_ylabel("Total inventory at start of day")
+
+    labels = [
+        f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
+        for row in calendar_df.itertuples(index=False)
+    ]
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_yticks(range(len(heat.index)))
+    ax.set_yticklabels([str(i) for i in heat.index], fontsize=8)
+
+    for row in calendar_df.itertuples(index=False):
+        if not bool(row.can_produce):
+            ax.axvline(row.t, linewidth=2.0, alpha=0.35)
+        if bool(row.is_holiday):
+            ax.axvline(row.t, linestyle="--", linewidth=1.0, alpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_unweighted_order_heatmap_by_total_stock(
+    policy_df: pd.DataFrame,
+    calendar_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
     df = add_policy_plot_columns(policy_df)
     heat = (
         df.groupby(["total_stock", "t"])["optimal_order"]
         .mean()
         .unstack("t")
+        .reindex(columns=range(HORIZON_DAYS))
         .sort_index(ascending=False)
     )
 
@@ -1099,16 +1493,16 @@ def plot_order_heatmap_by_total_stock(
     cbar = fig.colorbar(image, ax=ax)
     cbar.set_label("Average optimal order")
 
-    ax.set_title("Average optimal order by stage and total inventory")
+    ax.set_title("Average optimal order by stage and total stock")
     ax.set_xlabel("Stage / date")
     ax.set_ylabel("Total inventory at start of day")
 
-    x_labels = [
+    labels = [
         f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
         for row in calendar_df.itertuples(index=False)
     ]
-    ax.set_xticks(range(len(x_labels)))
-    ax.set_xticklabels(x_labels, fontsize=8)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
     ax.set_yticks(range(len(heat.index)))
     ax.set_yticklabels([str(i) for i in heat.index], fontsize=8)
 
@@ -1123,115 +1517,34 @@ def plot_order_heatmap_by_total_stock(
     plt.close(fig)
 
 
-def plot_policy_slices_by_inventory(
-    policy_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    output_path: Path,
-    selected_total_stocks: List[int] | None = None,
-) -> None:
-    """
-    Plot average optimal order over time for selected total inventory levels.
-    Useful for seeing whether the policy ramps up before production breaks.
-    """
-    df = add_policy_plot_columns(policy_df)
-
-    if selected_total_stocks is None:
-        available = sorted(df["total_stock"].unique())
-        if not available:
-            raise ValueError("No policy rows available for plotting.")
-        candidate_levels = [0, INVENTORY_CAP // 4, INVENTORY_CAP // 2, 3 * INVENTORY_CAP // 4]
-        selected_total_stocks = []
-        for level in candidate_levels:
-            nearest = min(available, key=lambda x: abs(x - level))
-            if nearest not in selected_total_stocks:
-                selected_total_stocks.append(nearest)
-
-    fig, ax = plt.subplots(figsize=(13, 5))
-    for stock in selected_total_stocks:
-        tmp = (
-            df[df["total_stock"] == stock]
-            .groupby("t")["optimal_order"]
-            .mean()
-            .reindex(range(HORIZON_DAYS))
-        )
-        ax.plot(tmp.index, tmp.to_numpy(), marker="o", label=f"Total stock = {stock}")
-
-    _shade_nonproduction_days(ax, calendar_df)
-    _format_stage_axis(ax, calendar_df)
-    ax.set_title("Policy slices: average optimal order for selected stock levels")
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Average optimal order")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_order_distribution_around_holidays(
+def plot_order_distribution_by_stage_weighted(
     policy_df: pd.DataFrame,
     calendar_df: pd.DataFrame,
     output_path: Path,
 ) -> None:
-    """
-    Boxplot of optimal orders by stage.
-    Unlike the mean plot, this shows how heterogeneous the state-dependent policy is.
-    """
     df = add_policy_plot_columns(policy_df)
-    data = [df.loc[df["t"] == t, "optimal_order"].to_numpy() for t in range(HORIZON_DAYS)]
-
-    fig, ax = plt.subplots(figsize=(13, 5))
-    ax.boxplot(data, positions=list(range(HORIZON_DAYS)), showfliers=False)
-    _shade_nonproduction_days(ax, calendar_df)
-    _format_stage_axis(ax, calendar_df)
-    ax.set_title("Distribution of optimal orders across reachable states")
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Optimal order")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-def plot_order_distribution_by_stage_stacked(
-    policy_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    """
-    Stacked barplot of the distribution of optimal orders for each stage.
-
-    This is the non-stationary version of the weekday order distribution plot.
-    It averages over reachable states, not over simulated state probabilities.
-    """
-    df = add_policy_plot_columns(policy_df)
-
     dist = (
-        df.groupby(["t", "optimal_order"])
-        .size()
-        .reset_index(name="count")
+        df.groupby(["t", "optimal_order"])["occupancy_probability"]
+        .sum()
+        .reset_index(name="mass")
     )
 
-    totals = dist.groupby("t")["count"].transform("sum")
-    dist["mass"] = dist["count"] / totals
+    totals = dist.groupby("t")["mass"].transform("sum")
+    dist["conditional_mass"] = dist["mass"] / totals
 
     pivot = (
-        dist.pivot(index="t", columns="optimal_order", values="mass")
+        dist.pivot(index="t", columns="optimal_order", values="conditional_mass")
         .fillna(0.0)
         .reindex(range(HORIZON_DAYS), fill_value=0.0)
     )
 
     fig, ax = plt.subplots(figsize=(16, 6))
-
     bottom = np.zeros(len(pivot))
     x = np.arange(len(pivot))
 
     for order in pivot.columns:
         values = pivot[order].to_numpy()
-        ax.bar(
-            x,
-            values,
-            bottom=bottom,
-            label=f"Order {order}",
-            width=0.85,
-        )
+        ax.bar(x, values, bottom=bottom, label=f"Order {order}", width=0.85)
         bottom += values
 
     _shade_nonproduction_days(ax, calendar_df)
@@ -1240,318 +1553,88 @@ def plot_order_distribution_by_stage_stacked(
         f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
         for row in calendar_df.itertuples(index=False)
     ]
-
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8)
     ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Reachable-state mass")
-    ax.set_title("Distribution of optimal orders by stage")
-
-    ax.legend(
-        title="Order size",
-        bbox_to_anchor=(1.01, 1.0),
-        loc="upper left",
-        ncol=2,
-        fontsize=8,
-    )
+    ax.set_ylabel("Conditional probability")
+    ax.set_ylim(0, 1)
+    ax.set_title("Distribution of optimal orders conditional on stage")
+    ax.legend(title="Order size", bbox_to_anchor=(1.01, 1.0), loc="upper left", ncol=2, fontsize=8)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
+
+
+def plot_expected_stock_and_order_by_stage(
+    stage_summary_df: pd.DataFrame,
+    calendar_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    fig, ax1 = plt.subplots(figsize=(13, 5))
+
+    ax1.plot(
+        stage_summary_df["t"],
+        stage_summary_df["expected_start_stock"],
+        marker="o",
+        label="Expected start stock",
+    )
+    ax1.plot(
+        stage_summary_df["t"],
+        stage_summary_df["expected_post_order_stock"],
+        marker="s",
+        linestyle="--",
+        label="Expected post-order stock",
+    )
+    ax1.set_ylabel("Expected stock")
+
+    ax2 = ax1.twinx()
+    ax2.plot(
+        stage_summary_df["t"],
+        stage_summary_df["expected_order"],
+        marker="^",
+        linestyle=":",
+        label="Expected order",
+    )
+    ax2.set_ylabel("Expected order")
+
+    _shade_nonproduction_days(ax1, calendar_df)
+    _format_stage_axis(ax1, calendar_df)
+    ax1.set_title("Expected stock and production over the finite horizon")
+    ax1.set_xlabel("Stage / date")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
 
 def generate_policy_plots(
     policy_df: pd.DataFrame,
     calendar_df: pd.DataFrame,
-    state_count_df: pd.DataFrame,
-    plots_dir: Path = PLOTS_DIR,
-) -> Dict[str, Path]:
-    """Generate all standard plots and return their paths."""
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    paths = {
-        "average_order_by_stage": plots_dir / "01_average_order_by_stage.png",
-        "reachable_state_counts": plots_dir / "02_reachable_state_counts.png",
-        "order_heatmap_by_total_stock": plots_dir / "03_order_heatmap_by_total_stock.png",
-        "policy_slices_by_inventory": plots_dir / "04_policy_slices_by_inventory.png",
-        "order_distribution_by_stage": plots_dir / "05_order_distribution_by_stage.png",
-        "order_distribution_by_stage_stacked": plots_dir / "12_order_distribution_by_stage_stacked.png",
-    }
-
-    plot_average_order_by_stage(policy_df, calendar_df, paths["average_order_by_stage"])
-    plot_reachable_state_counts(state_count_df, calendar_df, paths["reachable_state_counts"])
-    plot_order_heatmap_by_total_stock(policy_df, calendar_df, paths["order_heatmap_by_total_stock"])
-    plot_policy_slices_by_inventory(policy_df, calendar_df, paths["policy_slices_by_inventory"])
-    plot_order_distribution_around_holidays(policy_df, calendar_df, paths["order_distribution_by_stage"])
-    plot_order_distribution_by_stage_stacked(policy_df, calendar_df, paths["order_distribution_by_stage_stacked"],)
-
-    return paths
-
-def compute_shortage_outdate_diagnostics(
-    policy_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    stage_demand_pmfs: List[np.ndarray],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Computes shortage/outdate risk for the chosen optimal action in each reachable state.
-
-    Important:
-    These are averages over reachable states, not simulated realized frequencies.
-    """
-    rows = []
-
-    for row in policy_df.itertuples(index=False):
-        t = int(row.t)
-        state = (
-            int(getattr(row, "t")) * 0 + calendar_df.loc[t, "weekday_index"],
-            *[int(getattr(row, f"x{i + 1}")) for i in range(SHELF_LIFE - 1)]
-        )
-        action = int(row.optimal_order)
-        demand_probs = stage_demand_pmfs[t]
-
-        prob_shortage = 0.0
-        prob_outdate = 0.0
-        expected_shortage_units = 0.0
-        expected_outdate_units = 0.0
-
-        for demand, p in enumerate(demand_probs):
-            if p <= DEMAND_SUPPORT_TOL:
-                continue
-
-            _, shortage, outdate, _ = step_dynamics(
-                state=state,
-                action=action,
-                demand=demand,
-                shelf_life=SHELF_LIFE,
-            )
-
-            prob_shortage += float(p) * float(shortage > 0)
-            prob_outdate += float(p) * float(outdate > 0)
-            expected_shortage_units += float(p) * shortage
-            expected_outdate_units += float(p) * outdate
-
-        output_row = {
-            "t": t,
-            "date": row.date,
-            "weekday": row.weekday,
-            "is_holiday": bool(row.is_holiday),
-            "holiday_name": row.holiday_name,
-            "can_produce": bool(row.can_produce),
-            "total_stock": int(row.total_stock),
-            "optimal_order": action,
-            "prob_shortage": prob_shortage,
-            "prob_outdate": prob_outdate,
-            "expected_shortage_units": expected_shortage_units,
-            "expected_outdate_units": expected_outdate_units,
-        }
-
-        for i in range(SHELF_LIFE - 1):
-            output_row[f"x{i + 1}"] = int(getattr(row, f"x{i + 1}"))
-
-        rows.append(output_row)
-
-    risk_by_state_df = pd.DataFrame(rows)
-
-    risk_summary_df = (
-        risk_by_state_df
-        .groupby(["t", "date", "weekday", "is_holiday", "holiday_name", "can_produce"], dropna=False)
-        .agg(
-            avg_prob_shortage=("prob_shortage", "mean"),
-            max_prob_shortage=("prob_shortage", "max"),
-            avg_prob_outdate=("prob_outdate", "mean"),
-            max_prob_outdate=("prob_outdate", "max"),
-            avg_expected_shortage_units=("expected_shortage_units", "mean"),
-            max_expected_shortage_units=("expected_shortage_units", "max"),
-            avg_expected_outdate_units=("expected_outdate_units", "mean"),
-            max_expected_outdate_units=("expected_outdate_units", "max"),
-            num_reachable_states=("prob_shortage", "count"),
-        )
-        .reset_index()
-    )
-
-    return risk_summary_df, risk_by_state_df
-
-
-def plot_expected_shortage_outdate_by_stage(
-    risk_summary_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    fig, ax = plt.subplots(figsize=(13, 5))
-
-    ax.plot(
-        risk_summary_df["t"],
-        risk_summary_df["avg_expected_shortage_units"],
-        marker="o",
-        label="Expected shortage units",
-    )
-    ax.plot(
-        risk_summary_df["t"],
-        risk_summary_df["avg_expected_outdate_units"],
-        marker="s",
-        label="Expected outdated units",
-    )
-
-    _shade_nonproduction_days(ax, calendar_df)
-    _format_stage_axis(ax, calendar_df)
-
-    ax.set_title("Expected shortage and outdating by stage")
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Expected units")
-    ax.legend()
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_probability_shortage_outdate_by_stage(
-    risk_summary_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    output_path: Path,
-) -> None:
-    fig, ax = plt.subplots(figsize=(13, 5))
-
-    ax.plot(
-        risk_summary_df["t"],
-        risk_summary_df["avg_prob_shortage"],
-        marker="o",
-        label="Probability of shortage",
-    )
-    ax.plot(
-        risk_summary_df["t"],
-        risk_summary_df["avg_prob_outdate"],
-        marker="s",
-        label="Probability of outdating",
-    )
-
-    _shade_nonproduction_days(ax, calendar_df)
-    _format_stage_axis(ax, calendar_df)
-
-    ax.set_title("Probability of shortage and outdating by stage")
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Probability")
-    ax.legend()
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_risk_heatmap_by_total_stock(
-    risk_by_state_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
-    value_col: str,
-    title: str,
-    cbar_label: str,
-    output_path: Path,
-) -> None:
-    heat = (
-        risk_by_state_df
-        .groupby(["total_stock", "t"])[value_col]
-        .mean()
-        .unstack("t")
-        .sort_index(ascending=False)
-    )
-
-    fig, ax = plt.subplots(figsize=(13, 8))
-
-    image = ax.imshow(heat.to_numpy(), aspect="auto")
-    cbar = fig.colorbar(image, ax=ax)
-    cbar.set_label(cbar_label)
-
-    ax.set_title(title)
-    ax.set_xlabel("Stage / date")
-    ax.set_ylabel("Total inventory at start of day")
-
-    x_labels = [
-        f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
-        for row in calendar_df.itertuples(index=False)
-    ]
-
-    ax.set_xticks(range(len(x_labels)))
-    ax.set_xticklabels(x_labels, fontsize=8)
-
-    ax.set_yticks(range(len(heat.index)))
-    ax.set_yticklabels([str(i) for i in heat.index], fontsize=8)
-
-    for row in calendar_df.itertuples(index=False):
-        if not bool(row.can_produce):
-            ax.axvline(row.t, linewidth=2.0, alpha=0.35)
-        if bool(row.is_holiday):
-            ax.axvline(row.t, linestyle="--", linewidth=1.0, alpha=0.9)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def generate_risk_plots(
-    risk_summary_df: pd.DataFrame,
-    risk_by_state_df: pd.DataFrame,
-    calendar_df: pd.DataFrame,
+    stage_occupancy_summary_df: pd.DataFrame,
     plots_dir: Path = PLOTS_DIR,
 ) -> Dict[str, Path]:
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     paths = {
-        "expected_shortage_outdate_by_stage": plots_dir / "06_expected_shortage_outdate_by_stage.png",
-        "probability_shortage_outdate_by_stage": plots_dir / "07_probability_shortage_outdate_by_stage.png",
-        "shortage_probability_heatmap": plots_dir / "08_shortage_probability_heatmap.png",
-        "outdate_probability_heatmap": plots_dir / "09_outdate_probability_heatmap.png",
-        "expected_shortage_units_heatmap": plots_dir / "10_expected_shortage_units_heatmap.png",
-        "expected_outdate_units_heatmap": plots_dir / "11_expected_outdate_units_heatmap.png",
+        "occupancy_probability_heatmap": plots_dir / "01_occupancy_probability_heatmap.png",
+        "weighted_order_heatmap": plots_dir / "02_weighted_order_heatmap.png",
+        "order_distribution_by_stage": plots_dir / "03_order_distribution_by_stage.png",
+        "expected_stock_and_order_by_stage": plots_dir / "04_expected_stock_and_order_by_stage.png",
+        "unweighted_order_heatmap": plots_dir / "05_unweighted_order_heatmap.png",
     }
 
-    plot_expected_shortage_outdate_by_stage(
-        risk_summary_df,
-        calendar_df,
-        paths["expected_shortage_outdate_by_stage"],
-    )
-
-    plot_probability_shortage_outdate_by_stage(
-        risk_summary_df,
-        calendar_df,
-        paths["probability_shortage_outdate_by_stage"],
-    )
-
-    plot_risk_heatmap_by_total_stock(
-        risk_by_state_df,
-        calendar_df,
-        value_col="prob_shortage",
-        title="Probability of shortage by stage and total inventory",
-        cbar_label="Probability of shortage",
-        output_path=paths["shortage_probability_heatmap"],
-    )
-
-    plot_risk_heatmap_by_total_stock(
-        risk_by_state_df,
-        calendar_df,
-        value_col="prob_outdate",
-        title="Probability of outdating by stage and total inventory",
-        cbar_label="Probability of outdating",
-        output_path=paths["outdate_probability_heatmap"],
-    )
-
-    plot_risk_heatmap_by_total_stock(
-        risk_by_state_df,
-        calendar_df,
-        value_col="expected_shortage_units",
-        title="Expected shortage units by stage and total inventory",
-        cbar_label="Expected shortage units",
-        output_path=paths["expected_shortage_units_heatmap"],
-    )
-
-    plot_risk_heatmap_by_total_stock(
-        risk_by_state_df,
-        calendar_df,
-        value_col="expected_outdate_units",
-        title="Expected outdated units by stage and total inventory",
-        cbar_label="Expected outdated units",
-        output_path=paths["expected_outdate_units_heatmap"],
-    )
+    plot_occupancy_probability_heatmap(policy_df, calendar_df, paths["occupancy_probability_heatmap"])
+    plot_weighted_order_heatmap_by_total_stock(policy_df, calendar_df, paths["weighted_order_heatmap"])
+    plot_order_distribution_by_stage_weighted(policy_df, calendar_df, paths["order_distribution_by_stage"])
+    plot_expected_stock_and_order_by_stage(stage_occupancy_summary_df, calendar_df, paths["expected_stock_and_order_by_stage"])
+    plot_unweighted_order_heatmap_by_total_stock(policy_df, calendar_df, paths["unweighted_order_heatmap"])
 
     return paths
-
 
 
 # ============================================================
@@ -1563,6 +1646,7 @@ def main():
         raise ValueError("SHELF_LIFE must be at least 2.")
 
     OUTPUT_XLSX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     demand_pmf, K = load_demand_probabilities(DEMAND_XLSX_PATH, DEMAND_SHEET_NAME)
     calendar_df = build_calendar()
@@ -1599,19 +1683,24 @@ def main():
     for t in range(HORIZON_DAYS + 1):
         print(f"  t={t:2d}: {len(candidate_by_t[t])}")
 
-    # 3) Choose realistic initial states. This is deliberately not just the empty state
-    #    unless INITIAL_STATE_MODE is set to "empty".
+    # 3) Choose the initial distribution.
     start_weekday = int(calendar_df.loc[0, "weekday_index"])
     empty_start_state = (start_weekday,) + (0,) * (SHELF_LIFE - 1)
 
     if INITIAL_STATE_MODE == "empty":
-        initial_states = [empty_start_state]
-    elif INITIAL_STATE_MODE == "all_stationary_start_day":
-        initial_states = [s for s in stationary_states if s[0] == start_weekday]
+        initial_distribution = {empty_start_state: 1.0}
+    elif INITIAL_STATE_MODE == "stationary_start_day_distribution":
+        initial_distribution = compute_stationary_start_day_distribution(
+            states=stationary_states,
+            demand_pmf=demand_pmf,
+            policy=stationary_policy,
+            start_weekday=start_weekday,
+        )
     else:
         raise ValueError(f"Unknown INITIAL_STATE_MODE: {INITIAL_STATE_MODE}")
 
-    print(f"\nInitial states before finite-horizon structural filtering: {len(initial_states)}")
+    initial_states = list(initial_distribution.keys())
+    print(f"\nInitial states with positive initial probability: {len(initial_states)}")
 
     # 4) Apply the finite-horizon reachability filter.
     reachable_by_t = finite_horizon_reachability_filter(
@@ -1633,20 +1722,22 @@ def main():
         terminal_h=h_star,
     )
 
+    # 6) Compute occupancy probabilities under the non-stationary policy.
     occupancy, occupancy_df = compute_finite_horizon_occupancy_probabilities(
         reachable_by_t=reachable_by_t,
         policy=policy,
         calendar_df=calendar_df,
         stage_demand_pmfs=stage_demand_pmfs,
-        initial_states=initial_states,
+        initial_distribution=initial_distribution,
     )
-    merge_cols = ["t"] + [f"x{i + 1}" for i in range(SHELF_LIFE - 1)]
 
+    merge_cols = ["t"] + [f"x{i + 1}" for i in range(SHELF_LIFE - 1)]
     policy_df = policy_df.merge(
         occupancy_df[merge_cols + ["occupancy_probability"]],
         on=merge_cols,
         how="left",
     )
+    policy_df["occupancy_probability"] = policy_df["occupancy_probability"].fillna(0.0)
 
     visited_policy_df = (
         policy_df[policy_df["occupancy_probability"] > 1e-12]
@@ -1654,22 +1745,23 @@ def main():
         .sort_values(["t", "occupancy_probability"], ascending=[True, False])
     )
 
-    policy_df["occupancy_probability"] = policy_df["occupancy_probability"].fillna(0.0)
-
+    # 7) Build summary sheets.
     stage_summary_df = build_stage_summary(policy_df, reachable_by_t)
+    stage_occupancy_summary_df = build_occupancy_weighted_stage_summary(policy_df, calendar_df)
     state_count_df = build_reachable_state_count_table(candidate_by_t, reachable_by_t)
-    initial_state_df = build_initial_state_table([s for s in initial_states if s in set(candidate_by_t[0])])
+    initial_distribution_df = build_initial_distribution_table(initial_distribution)
     terminal_state_df = build_terminal_state_table(reachable_by_t[HORIZON_DAYS], h_star)
-    risk_summary_df, risk_by_state_df = compute_shortage_outdate_diagnostics(
-        policy_df=policy_df,
-        calendar_df=calendar_df,
-        stage_demand_pmfs=stage_demand_pmfs,
-    )
 
     cost_breakdown_df = compute_nonstationary_cost_breakdown(
         policy=policy,
         occupancy=occupancy,
         stage_demand_pmfs=stage_demand_pmfs,
+    )
+
+    frequency_tables, frequency_long_df, dominant_order_up_to_df = build_all_frequency_tables(
+        policy_df=policy_df,
+        calendar_df=calendar_df,
+        scale=1_000_000,
     )
 
     run_summary_df = pd.DataFrame({
@@ -1684,7 +1776,8 @@ def main():
             "initial_state_mode",
             "stationary_states_after_filtering",
             "finite_horizon_policy_rows",
-            "initial_states_used",
+            "visited_policy_rows_positive_occupancy",
+            "initial_states_with_positive_probability",
             "terminal_states_reached",
             "shelf_life",
             "inventory_cap",
@@ -1705,7 +1798,8 @@ def main():
             INITIAL_STATE_MODE,
             len(stationary_states),
             len(policy_df),
-            len(reachable_by_t[0]),
+            len(visited_policy_df),
+            len(initial_distribution),
             len(reachable_by_t[HORIZON_DAYS]),
             SHELF_LIFE,
             INVENTORY_CAP,
@@ -1717,41 +1811,39 @@ def main():
         ],
     })
 
+    # 8) Write Excel output.
     with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
         run_summary_df.to_excel(writer, sheet_name="RunSummary", index=False)
         cost_breakdown_df.to_excel(writer, sheet_name="CostBreakdown", index=False)
         calendar_df.to_excel(writer, sheet_name="Calendar", index=False)
         state_count_df.to_excel(writer, sheet_name="StateCounts", index=False)
-        stage_summary_df.to_excel(writer, sheet_name="StageSummary", index=False)
+        stage_summary_df.to_excel(writer, sheet_name="StageSummary_Unweighted", index=False)
+        stage_occupancy_summary_df.to_excel(writer, sheet_name="StageSummary_Weighted", index=False)
+        dominant_order_up_to_df.to_excel(writer, sheet_name="DominantOrderUpTo", index=False)
+        frequency_long_df.to_excel(writer, sheet_name="FrequencyTables_Long", index=False)
         policy_df.to_excel(writer, sheet_name="NSPolicy_AllStages", index=False)
-        initial_state_df.to_excel(writer, sheet_name="InitialStates", index=False)
-        terminal_state_df.to_excel(writer, sheet_name="TerminalStates", index=False)
-        risk_summary_df.to_excel(writer, sheet_name="RiskSummary", index=False)
-        risk_by_state_df.to_excel(writer, sheet_name="RiskByState", index=False)
-        occupancy_df.to_excel(writer, sheet_name="OccupancyProbabilities", index=False)
         visited_policy_df.to_excel(writer, sheet_name="VisitedStates_NS", index=False)
+        occupancy_df.to_excel(writer, sheet_name="OccupancyProbabilities", index=False)
+        initial_distribution_df.to_excel(writer, sheet_name="InitialDistribution", index=False)
+        terminal_state_df.to_excel(writer, sheet_name="TerminalStates", index=False)
 
+        for sheet_name, table_df in frequency_tables.items():
+            table_df.to_excel(writer, sheet_name=sheet_name[:31], index=False, header=False)
+
+    # 9) Generate only the plots that mirror the stationary analysis.
     plot_paths = generate_policy_plots(
-        policy_df=visited_policy_df,
+        policy_df=policy_df,
         calendar_df=calendar_df,
-        state_count_df=state_count_df,
+        stage_occupancy_summary_df=stage_occupancy_summary_df,
         plots_dir=PLOTS_DIR,
     )
-    risk_plot_paths = generate_risk_plots(
-        risk_summary_df=risk_summary_df,
-        risk_by_state_df=risk_by_state_df,
-        calendar_df=calendar_df,
-        plots_dir=PLOTS_DIR,
-    )
+    plot_paths.update(generate_frequency_table_plots(frequency_tables, calendar_df, PLOTS_DIR))
 
-    plot_paths.update(risk_plot_paths)
+    print("\nOCCUPANCY-WEIGHTED STAGE SUMMARY")
+    print(stage_occupancy_summary_df.to_string(index=False))
 
-    print("\nMOST READABLE VERSION OF THE NON-STATIONARY POLICY")
-    print("This is not the exact full policy. It averages over reachable states at each stage.")
-    print(stage_summary_df.head(HORIZON_DAYS).to_string(index=False))
-
-    print("\nTOP POLICY ROWS")
-    print(policy_df.head(PRINT_TOP_ROWS).to_string(index=False))
+    print("\nDOMINANT ORDER-UP-TO LEVELS")
+    print(dominant_order_up_to_df.to_string(index=False))
 
     print("\nCOST BREAKDOWN")
     print(cost_breakdown_df.to_string(index=False))

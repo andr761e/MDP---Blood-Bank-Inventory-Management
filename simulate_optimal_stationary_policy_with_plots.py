@@ -24,20 +24,20 @@ INVENTORY_CAP = 50
 MAX_ORDER = 35
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}
 
-C_OUTDATE = 2500.0
+C_OUTDATE = 2410.0
 C_SHORTAGE = 20000.0
 C_HOLDING = 5.0
-C_PRODUCTION = 2500.0
+C_PRODUCTION = 2410.0
 
 START_STATE = (2, 0, 0, 0, 8)  # (weekday, x1, x2, ..., x_{SHELF_LIFE-1})
 SIMULATION_DAYS = 730
 RANDOM_SEED = 42
 N_REPLICATIONS = 1
 
-OUTPUT_DIR = Path("data")
+OUTPUT_DIR = Path("data/Simulation")
 POLICY_OUTPUT_XLSX_PATH = OUTPUT_DIR / "optimal_stationary_policy_for_simulation.xlsx"
 SIM_OUTPUT_XLSX_PATH = OUTPUT_DIR / "stationary_policy_simulation.xlsx"
-PLOTS_DIR = OUTPUT_DIR / "simulation_plots"
+PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 
 REDUCED_COST_TOL = 1e-8
 

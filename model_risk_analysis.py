@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 # Reuse the model, LP solver, evaluation tools and plot functions from your main script.
 # This file should be placed in the same folder as compute_average_cost_optimal_policy.py.
@@ -44,8 +45,6 @@ from compute_average_cost_optimal_policy import (
     plot_policy_heatmap_avg_order,
     plot_policy_heatmap_weighted_order,
     plot_stationary_probability_by_stock,
-    plot_policy_scatter_all_states,
-    plot_policy_scatter_weighted_states,
     plot_order_distribution_by_weekday,
 )
 
@@ -64,13 +63,12 @@ TRUE_DEMAND_XLSX_PATH = Path("weekday_demand_probabilities_plus10.xlsx")
 TRUE_SCENARIO_NAME = "plus10"
 
 # Output folders/files
-OUTPUT_DIR = Path("data/model_risk")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
+OUTPUT_DIR = Path("data/Model risk")
 OUTPUT_XLSX_PATH = OUTPUT_DIR / f"model_risk_{ASSUMED_SCENARIO_NAME}_policy_under_{TRUE_SCENARIO_NAME}.xlsx"
-PLOTS_DIR = OUTPUT_DIR / f"plots_{ASSUMED_SCENARIO_NAME}_policy_under_{TRUE_SCENARIO_NAME}"
-PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
 # COMMON STATE SPACE HELPERS
@@ -397,14 +395,319 @@ def build_component_difference_table(
 
     return diff_df
 
+# ============================================================
+# REPORT-ORIENTED TABLES AND PLOTS
+# ============================================================
+
+FREQUENCY_TABLE_SCALE = 1_000_000
+FREQUENCY_PROBABILITY_CUTOFF = 1e-12
+
+CASE_SPECS = {
+    "AA": {
+        "case": "assumed_policy_evaluated_under_assumed_demand",
+        "short_label": "Assumed policy / assumed demand",
+        "folder": "assumed_policy_evaluated_under_assumed_demand",
+    },
+    "AT": {
+        "case": "assumed_policy_evaluated_under_true_demand",
+        "short_label": "Assumed policy / true demand",
+        "folder": "assumed_policy_evaluated_under_true_demand",
+    },
+    "TT": {
+        "case": "true_policy_evaluated_under_true_demand",
+        "short_label": "True policy / true demand",
+        "folder": "true_policy_evaluated_under_true_demand",
+    },
+}
+
+
+def _integerize_scaled_probabilities(probs: pd.Series, scale: int) -> pd.Series:
+    """Convert probabilities to integer frequencies summing exactly to ``scale``."""
+    values = probs.astype(float).to_numpy()
+    raw = values * scale
+    floors = np.floor(raw).astype(int)
+
+    remainder = int(scale - floors.sum())
+    fractional = raw - floors
+
+    if remainder > 0:
+        order = np.argsort(-fractional)
+        for pos in order[:remainder]:
+            floors[pos] += 1
+    elif remainder < 0:
+        order = np.argsort(fractional)
+        removed = 0
+        for pos in order:
+            if floors[pos] > 0:
+                floors[pos] -= 1
+                removed += 1
+                if removed == abs(remainder):
+                    break
+
+    return pd.Series(floors.astype(int), index=probs.index)
+
+
+def build_order_distribution_long(policy_df: pd.DataFrame, case_code: str, case_label: str) -> pd.DataFrame:
+    """Conditional distribution P(optimal order = a | weekday) for one case."""
+    rows = []
+    grouped = (
+        policy_df.groupby(["weekday", "optimal_order"], as_index=False)["stationary_probability"]
+        .sum()
+    )
+    weekday_mass = policy_df.groupby("weekday")["stationary_probability"].sum().to_dict()
+
+    for row in grouped.itertuples(index=False):
+        mass = float(weekday_mass.get(row.weekday, 0.0))
+        conditional_probability = float(row.stationary_probability) / mass if mass > 0 else np.nan
+        rows.append({
+            "case_code": case_code,
+            "case_label": case_label,
+            "weekday": row.weekday,
+            "optimal_order": int(row.optimal_order),
+            "stationary_probability_mass": float(row.stationary_probability),
+            "conditional_probability_given_weekday": conditional_probability,
+        })
+
+    return pd.DataFrame(rows).sort_values(["case_code", "weekday", "optimal_order"])
+
+
+def build_frequency_table_for_weekday(
+    policy_df: pd.DataFrame,
+    weekday: str,
+    case_code: str,
+    case_label: str,
+    scale: int = FREQUENCY_TABLE_SCALE,
+    min_mass: float = FREQUENCY_PROBABILITY_CUTOFF,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build a book-style state-action frequency table for one weekday and one case.
+
+    Columns are pre-order total stock ``x``. Rows are post-order stock
+    ``S_1 = x + a``. Entries are stationary probabilities conditional on the
+    weekday, scaled to ``scale`` observations.
+    """
+    tmp = policy_df[
+        (policy_df["weekday"] == weekday)
+        & (policy_df["stationary_probability"] > min_mass)
+    ].copy()
+
+    if tmp.empty:
+        raise ValueError(f"No positive stationary probability for {weekday} in case {case_code}.")
+
+    total_mass = float(tmp["stationary_probability"].sum())
+    tmp["conditional_probability"] = tmp["stationary_probability"] / total_mass
+    tmp["post_order_stock_S1"] = tmp["total_stock"] + tmp["optimal_order"]
+
+    grouped = (
+        tmp.groupby(["post_order_stock_S1", "total_stock"], as_index=False)["conditional_probability"]
+        .sum()
+    )
+
+    keys = list(zip(grouped["post_order_stock_S1"], grouped["total_stock"]))
+    scaled = _integerize_scaled_probabilities(
+        pd.Series(grouped["conditional_probability"].to_numpy(), index=keys),
+        scale,
+    )
+
+    long_rows = []
+    for (s1, x), freq in scaled.items():
+        if freq <= 0:
+            continue
+        long_rows.append({
+            "case_code": case_code,
+            "case_label": case_label,
+            "weekday": weekday,
+            "total_stock": int(x),
+            "post_order_stock_S1": int(s1),
+            "frequency": int(freq),
+            "probability_given_weekday": int(freq) / scale,
+        })
+
+    long_df = pd.DataFrame(long_rows)
+    x_values = sorted(long_df["total_stock"].unique())
+    s_values = sorted(long_df["post_order_stock_S1"].unique(), reverse=True)
+
+    matrix = (
+        long_df.pivot(index="post_order_stock_S1", columns="total_stock", values="frequency")
+        .reindex(index=s_values, columns=x_values)
+        .fillna(0)
+        .astype(int)
+    )
+
+    table_rows = []
+    table_rows.append(["Stock x"] + x_values + ["Freq(S_1)"])
+    table_rows.append(["Up-to S_1"] + [""] * len(x_values) + [""])
+
+    for s1 in s_values:
+        row_vals = []
+        for x in x_values:
+            val = int(matrix.loc[s1, x])
+            row_vals.append("" if val == 0 else val)
+        table_rows.append([s1] + row_vals + [int(matrix.loc[s1].sum())])
+
+    col_totals = matrix.sum(axis=0).astype(int)
+    table_rows.append(["Freq(x)"] + [int(col_totals.loc[x]) for x in x_values] + [int(matrix.values.sum())])
+
+    return pd.DataFrame(table_rows), long_df
+
+
+def build_frequency_tables_for_case(
+    policy_df: pd.DataFrame,
+    case_code: str,
+    case_label: str,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> tuple[Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+    """Build frequency tables and dominant S_1 summary for all production weekdays."""
+    table_by_sheet: Dict[str, pd.DataFrame] = {}
+    long_tables = []
+    summary_rows = []
+
+    for day in sorted(PRODUCTION_DAYS):
+        weekday = WEEKDAYS[day]
+        table_df, long_df = build_frequency_table_for_weekday(
+            policy_df=policy_df,
+            weekday=weekday,
+            case_code=case_code,
+            case_label=case_label,
+            scale=scale,
+        )
+        long_tables.append(long_df)
+
+        s1_summary = long_df.groupby("post_order_stock_S1")["frequency"].sum().sort_values(ascending=False)
+        dominant_s1 = int(s1_summary.index[0])
+        dominant_freq = int(s1_summary.iloc[0])
+
+        tmp = policy_df[
+            (policy_df["weekday"] == weekday)
+            & (policy_df["stationary_probability"] > FREQUENCY_PROBABILITY_CUTOFF)
+        ].copy()
+        mass = float(tmp["stationary_probability"].sum())
+        expected_order = float((tmp["stationary_probability"] * tmp["optimal_order"]).sum() / mass)
+        expected_start_stock = float((tmp["stationary_probability"] * tmp["total_stock"]).sum() / mass)
+
+        summary_rows.append({
+            "case_code": case_code,
+            "case_label": case_label,
+            "weekday": weekday,
+            "dominant_post_order_stock_S1": dominant_s1,
+            "dominant_S1_frequency": dominant_freq,
+            "dominant_S1_share": dominant_freq / scale,
+            "expected_start_stock": expected_start_stock,
+            "expected_order": expected_order,
+            "expected_post_order_stock": expected_start_stock + expected_order,
+        })
+
+        table_by_sheet[f"Freq_{case_code}_{weekday[:3]}"] = table_df
+
+    return (
+        table_by_sheet,
+        pd.concat(long_tables, ignore_index=True) if long_tables else pd.DataFrame(),
+        pd.DataFrame(summary_rows),
+    )
+
+
+def build_all_frequency_tables_for_cases(
+    case_policy_dfs: Dict[str, pd.DataFrame],
+) -> tuple[Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+    all_tables: Dict[str, pd.DataFrame] = {}
+    all_long = []
+    all_summary = []
+
+    for case_code, policy_df in case_policy_dfs.items():
+        spec = CASE_SPECS[case_code]
+        tables, long_df, summary_df = build_frequency_tables_for_case(
+            policy_df=policy_df,
+            case_code=case_code,
+            case_label=spec["short_label"],
+        )
+        all_tables.update(tables)
+        all_long.append(long_df)
+        all_summary.append(summary_df)
+
+    return (
+        all_tables,
+        pd.concat(all_long, ignore_index=True) if all_long else pd.DataFrame(),
+        pd.concat(all_summary, ignore_index=True) if all_summary else pd.DataFrame(),
+    )
+
+
+def plot_frequency_table_image(table_df: pd.DataFrame, title: str, output_path: Path) -> None:
+    """Save a PNG rendering of one book-style frequency table."""
+    ncols = table_df.shape[1]
+    nrows = table_df.shape[0]
+    fig_width = max(10, 0.55 * ncols)
+    fig_height = max(2.5, 0.35 * nrows + 1.2)
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+    ax.set_title(title, fontsize=12, pad=10)
+
+    table = ax.table(cellText=table_df.astype(str).values, loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.25)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def generate_frequency_table_plots(
+    frequency_tables: Dict[str, pd.DataFrame],
+    plots_dir: Path = PLOTS_DIR,
+) -> Dict[str, Path]:
+    paths = {}
+    for sheet_name, table_df in frequency_tables.items():
+        _, case_code, day_abbrev = sheet_name.split("_")
+        spec = CASE_SPECS[case_code]
+        folder = plots_dir / spec["folder"] / "frequency_tables"
+        folder.mkdir(parents=True, exist_ok=True)
+        weekday = next(day for day in WEEKDAYS if day.startswith(day_abbrev))
+        title = (
+            f"(State, action)-frequency table for 1,000,000 {weekday}s\n"
+            f"{spec['short_label']}"
+        )
+        path = folder / f"frequency_table_{weekday.lower()}.png"
+        plot_frequency_table_image(table_df, title, path)
+        paths[sheet_name] = path
+    return paths
+
+
+def plot_cost_comparison(comparison_df: pd.DataFrame, output_path: Path) -> None:
+    df = comparison_df[comparison_df["case"] != "Model-risk loss"].copy()
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(df))
+    ax.bar(x, df["cost_per_day"].astype(float).to_numpy())
+    ax.set_xticks(x)
+    ax.set_xticklabels(["Assumed/assumed", "Assumed/true", "True/true"], rotation=20, ha="right")
+    ax.set_ylabel("Average cost per day")
+    ax.set_title("Model-risk cost comparison")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_component_delta(diff_df: pd.DataFrame, output_path: Path, title: str) -> None:
+    df = diff_df[diff_df["component"] != "total_immediate_cost"].copy()
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(df))
+    ax.bar(x, df["delta_cost_per_day"].astype(float).to_numpy())
+    ax.axhline(0.0, linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(df["component"].astype(str).to_list(), rotation=20, ha="right")
+    ax.set_ylabel("Delta cost per day")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def save_policy_plots(policy_df: pd.DataFrame, folder: Path) -> None:
+    """Save only the report-relevant plots. No scatter plots."""
     folder.mkdir(parents=True, exist_ok=True)
-    plot_policy_heatmap_avg_order(policy_df, folder / "heatmap_avg_order.png")
-    plot_policy_heatmap_weighted_order(policy_df, folder / "heatmap_weighted_order.png")
     plot_stationary_probability_by_stock(policy_df, folder / "heatmap_stationary_probability.png")
-    plot_policy_scatter_all_states(policy_df, folder / "scatter_all_states.png")
-    plot_policy_scatter_weighted_states(policy_df, folder / "scatter_weighted_states.png")
+    plot_policy_heatmap_weighted_order(policy_df, folder / "heatmap_weighted_order.png")
     plot_order_distribution_by_weekday(policy_df, folder / "order_distribution_by_weekday.png")
+    plot_policy_heatmap_avg_order(policy_df, folder / "heatmap_avg_order_appendix.png")
 
 
 # ============================================================
@@ -650,6 +953,31 @@ def main() -> None:
     })
 
     # ------------------------------------------------------------
+    # 4b. Report-oriented policy structure tables
+    # ------------------------------------------------------------
+    case_policy_dfs = {
+        "AA": policy_df_assumed_eval_assumed,
+        "AT": policy_df_assumed_eval_true,
+        "TT": policy_df_true_eval_true,
+    }
+
+    frequency_tables, frequency_long_df, dominant_order_up_to_df = build_all_frequency_tables_for_cases(
+        case_policy_dfs
+    )
+
+    order_distribution_long_df = pd.concat(
+        [
+            build_order_distribution_long(
+                policy_df=case_policy_dfs[case_code],
+                case_code=case_code,
+                case_label=CASE_SPECS[case_code]["short_label"],
+            )
+            for case_code in ["AA", "AT", "TT"]
+        ],
+        ignore_index=True,
+    )
+
+    # ------------------------------------------------------------
     # 5. Save Excel outputs
     # ------------------------------------------------------------
     with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
@@ -675,12 +1003,35 @@ def main() -> None:
         visited_true_eval_true.to_excel(writer, sheet_name="Visited_True_EvalTrue", index=False)
         compact_true_eval_true.to_excel(writer, sheet_name="Compact_True_EvalTrue", index=False)
 
+        dominant_order_up_to_df.to_excel(writer, sheet_name="DominantOrderUpTo", index=False)
+        frequency_long_df.to_excel(writer, sheet_name="FrequencyTables_Long", index=False)
+        order_distribution_long_df.to_excel(writer, sheet_name="OrderDistribution_Long", index=False)
+
+        # Book-style frequency tables. Sheet names are kept short to satisfy Excel's 31-char limit.
+        for sheet_name, table_df in frequency_tables.items():
+            table_df.to_excel(writer, sheet_name=sheet_name[:31], index=False, header=False)
+
     # ------------------------------------------------------------
     # 6. Save plots
     # ------------------------------------------------------------
     save_policy_plots(policy_df_assumed_eval_assumed, PLOTS_DIR / "assumed_policy_evaluated_under_assumed_demand")
     save_policy_plots(policy_df_assumed_eval_true, PLOTS_DIR / "assumed_policy_evaluated_under_true_demand")
     save_policy_plots(policy_df_true_eval_true, PLOTS_DIR / "true_policy_evaluated_under_true_demand")
+
+    comparison_plots_dir = PLOTS_DIR / "comparison"
+    comparison_plots_dir.mkdir(parents=True, exist_ok=True)
+    plot_cost_comparison(comparison_df, comparison_plots_dir / "cost_comparison.png")
+    plot_component_delta(
+        cost_breakdown_model_risk_loss_df,
+        comparison_plots_dir / "model_risk_loss_by_component.png",
+        "Model-risk loss by cost component",
+    )
+    plot_component_delta(
+        cost_breakdown_demand_shift_df,
+        comparison_plots_dir / "demand_shift_effect_by_component.png",
+        "Effect of evaluating the assumed policy under true demand",
+    )
+    generate_frequency_table_plots(frequency_tables, PLOTS_DIR)
 
     # ------------------------------------------------------------
     # 7. Print results
@@ -696,6 +1047,9 @@ def main() -> None:
 
     print("\nMost readable weekday plan for ASSUMED policy evaluated under TRUE demand:")
     print(weekday_assumed_eval_true.to_string(index=False))
+
+    print("\nDominant order-up-to levels:")
+    print(dominant_order_up_to_df.to_string(index=False))
 
     print("\nTop visited states for ASSUMED policy evaluated under TRUE demand:")
     print(visited_assumed_eval_true.head(PRINT_TOP_ROWS).to_string(index=False))

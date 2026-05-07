@@ -33,14 +33,25 @@ C_HOLDING = 5.0                   # c_H
 C_PRODUCTION = 2410.0             # Optional cost for production (keep at 0 for now)
 
 # Output file name
-OUTPUT_XLSX_PATH = Path("data/optimal_stationary_policy_lp_v2.xlsx")
+# Output folders/files
+OUTPUT_DIR = Path("data/Stationary")
+OUTPUT_XLSX_PATH = OUTPUT_DIR / "optimal_stationary_policy_lp_v2.xlsx"
+PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 
-PLOTS_DIR = Path("data/policy_plots")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Numerical tolerances
 REDUCED_COST_TOL = 1e-8
 PRINT_TOP_ROWS = 30
+
+# Frequency-table settings. These tables mimic the state-action frequency
+# tables in Haijema et al. Chapter 10, but use exact stationary probabilities
+# rather than Monte Carlo simulation. Each weekday table is scaled to this
+# many pseudo-observations conditional on that weekday.
+FREQUENCY_TABLE_SCALE = 1_000_000
+PLOT_FREQUENCY_TABLES = True
+
 
 
 # WEEKSDAYS
@@ -676,6 +687,179 @@ def build_visited_state_table(state_prob_df: pd.DataFrame, cutoff: float = 1e-6)
     return state_prob_df[state_prob_df["stationary_probability"] > cutoff].copy()
 
 
+def probabilities_to_integer_frequencies(probabilities: np.ndarray, scale: int) -> np.ndarray:
+    """
+    Convert probabilities to integer frequencies that sum exactly to `scale`.
+
+    We use the largest-remainder method: first take floors, then distribute the
+    remaining counts to the cells with the largest fractional remainders. This
+    gives table entries that behave like simulated frequencies, but are based on
+    the exact stationary distribution.
+    """
+    probs = np.asarray(probabilities, dtype=float)
+    probs = np.maximum(probs, 0.0)
+
+    total = probs.sum()
+    if total <= 0:
+        return np.zeros_like(probs, dtype=int)
+
+    probs = probs / total
+    raw = probs * int(scale)
+    counts = np.floor(raw).astype(int)
+    remainder = int(scale) - int(counts.sum())
+
+    if remainder > 0:
+        fractional_parts = raw - counts
+        add_to = np.argsort(-fractional_parts)[:remainder]
+        counts[add_to] += 1
+
+    return counts
+
+
+def build_book_style_frequency_table_for_weekday(
+    policy_df: pd.DataFrame,
+    weekday: str,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> pd.DataFrame:
+    """
+    Build a book-style (state, action)-frequency table for one weekday.
+
+    Rows are post-order stock levels S_1 = x + a*(d,x), columns are pre-order
+    total stock levels x, and the entries are conditional frequencies for that
+    weekday. The frequencies are exact stationary probabilities scaled to `scale`,
+    not simulated counts.
+
+    This mimics the tables in Chapter 10, where rows are labelled "Up-to S_1",
+    columns are labelled "Stock x", and margins show Freq(S_1) and Freq(x).
+    """
+    group = policy_df[policy_df["weekday"] == weekday].copy()
+    if group.empty:
+        return pd.DataFrame({"Stock x": ["Up-to S_1", "Freq(x)", "Total simulated weekday observations"], "Freq(S_1)": ["", 0, 0]})
+
+    day_prob = float(group["stationary_probability"].sum())
+    if day_prob <= 0:
+        return pd.DataFrame({"Stock x": ["Up-to S_1", "Freq(x)", "Total simulated weekday observations"], "Freq(S_1)": ["", 0, 0]})
+
+    group["conditional_probability_given_weekday"] = group["stationary_probability"] / day_prob
+    group["post_order_stock"] = group["total_stock"] + group["optimal_order"]
+
+    prob_pivot = (
+        group.groupby(["post_order_stock", "total_stock"], as_index=True)["conditional_probability_given_weekday"]
+        .sum()
+        .unstack(fill_value=0.0)
+    )
+
+    # Convert the full matrix to integer frequencies summing exactly to scale.
+    counts_array = probabilities_to_integer_frequencies(prob_pivot.to_numpy().ravel(), scale)
+    count_matrix = pd.DataFrame(
+        counts_array.reshape(prob_pivot.shape),
+        index=prob_pivot.index.astype(int),
+        columns=prob_pivot.columns.astype(int),
+    )
+
+    # Keep only rows/columns that actually occur after rounding. This makes the
+    # table much more report-friendly and closer to the chapter 10 layout.
+    row_sums = count_matrix.sum(axis=1)
+    col_sums = count_matrix.sum(axis=0)
+    count_matrix = count_matrix.loc[row_sums > 0, col_sums > 0].copy()
+
+    if count_matrix.empty:
+        return pd.DataFrame({"Stock x": ["Up-to S_1", "Freq(x)", "Total simulated weekday observations"], "Freq(S_1)": ["", 0, 0]})
+
+    count_matrix = count_matrix.sort_index(ascending=False)
+    count_matrix = count_matrix.reindex(sorted(count_matrix.columns), axis=1)
+
+    row_sums = count_matrix.sum(axis=1).astype(int)
+    col_sums = count_matrix.sum(axis=0).astype(int)
+
+    # Blank out zero cells in the inner matrix to mimic the sparse table layout
+    # from the book. Margins remain numeric.
+    display_matrix = count_matrix.astype(object).where(count_matrix != 0, "")
+
+    rows = []
+    stock_columns = list(display_matrix.columns)
+    rows.append(["Up-to S_1"] + [""] * len(stock_columns) + [""])
+
+    for post_order_stock in display_matrix.index:
+        rows.append(
+            [int(post_order_stock)]
+            + [display_matrix.loc[post_order_stock, col] for col in stock_columns]
+            + [int(row_sums.loc[post_order_stock])]
+        )
+
+    rows.append(["Freq(x)"] + [int(col_sums.loc[col]) for col in stock_columns] + [int(col_sums.sum())])
+
+    table_df = pd.DataFrame(
+        rows,
+        columns=["Stock x"] + [str(int(c)) for c in stock_columns] + ["Freq(S_1)"],
+    )
+    return table_df
+
+
+def build_book_style_frequency_tables_by_weekday(
+    policy_df: pd.DataFrame,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Return one book-style frequency table per weekday.
+    """
+    return {
+        weekday: build_book_style_frequency_table_for_weekday(policy_df, weekday, scale=scale)
+        for weekday in WEEKDAYS
+    }
+
+
+def plot_book_style_frequency_table(
+    table_df: pd.DataFrame,
+    weekday: str,
+    output_path: Path,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> None:
+    """
+    Save a table-like PNG version of the frequency table.
+
+    This is mainly useful for appendix material. For the main report, the Excel
+    tables are usually easier to copy into LaTeX and format cleanly.
+    """
+    if table_df.empty:
+        return
+
+    n_rows, n_cols = table_df.shape
+    fig_width = max(12, min(30, 0.45 * n_cols + 2.5))
+    fig_height = max(5, min(20, 0.32 * n_rows + 1.8))
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+    ax.set_title(
+        f"(State, action)-frequency table for {scale:,} stationary {weekday}s",
+        fontsize=12,
+        pad=12,
+    )
+
+    table = ax.table(
+        cellText=table_df.values,
+        colLabels=table_df.columns,
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    table.scale(1.0, 1.15)
+
+    # Slightly emphasize header, left label column, and margin row/column.
+    last_row = len(table_df)
+    last_col = len(table_df.columns) - 1
+    for (row, col), cell in table.get_celld().items():
+        if row == 0 or col == 0 or col == last_col or row == last_row:
+            cell.set_linewidth(0.8)
+        else:
+            cell.set_linewidth(0.25)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close()
+
+
 # ============================================================
 # OUTPUT HELPERS
 # ============================================================
@@ -843,6 +1027,15 @@ def plot_policy_scatter_weighted_states(policy_df: pd.DataFrame, output_path: Pa
     plt.close()
 
 def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Plot the conditional distribution of optimal orders given each weekday.
+
+    For each weekday, the stacked bar sums to 1:
+        P(optimal_order = a | weekday)
+
+    This is more interpretable than plotting unconditional stationary probability mass,
+    because the plot then compares order distributions within each weekday.
+    """
 
     dist_df = (
         policy_df.groupby(["weekday", "optimal_order"], as_index=False)["stationary_probability"]
@@ -855,7 +1048,12 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
         .fillna(0.0)
     )
 
-    # Keep only order sizes that actually occur with positive stationary mass
+    # Convert unconditional stationary mass into conditional mass given weekday.
+    row_sums = pivot_df.sum(axis=1)
+
+    pivot_df = pivot_df.div(row_sums.replace(0.0, np.nan), axis=0).fillna(0.0)
+
+    # Keep only order sizes that actually occur with positive conditional mass.
     used_orders = [col for col in pivot_df.columns if pivot_df[col].sum() > 1e-12]
     pivot_df = pivot_df[used_orders]
 
@@ -871,10 +1069,10 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
 
     plt.xticks(x, pivot_df.index, rotation=45)
     plt.xlabel("Weekday")
-    plt.ylabel("Stationary probability mass")
-    plt.title("Distribution of optimal orders by weekday")
+    plt.ylabel("Conditional probability")
+    plt.ylim(0.0, 1.0)
+    plt.title("Distribution of optimal orders conditional on weekday")
 
-    # Put legend outside and use multiple columns if there are many order sizes
     n_orders = len(pivot_df.columns)
     ncol = min(4, max(1, int(np.ceil(n_orders / 8))))
 
@@ -976,6 +1174,10 @@ def main():
     state_prob_df = build_state_probability_table(states, pi, det_policy)
     visited_state_df = build_visited_state_table(state_prob_df, cutoff=1e-6)
     weekday_plan_df = build_weekday_recommendation_table(states, pi, det_policy)
+    frequency_tables_by_weekday = build_book_style_frequency_tables_by_weekday(
+        policy_df=policy_df,
+        scale=FREQUENCY_TABLE_SCALE,
+    )
 
     g_eval = float(np.dot(pi, c_vec))
 
@@ -1030,14 +1232,25 @@ def main():
         compact_df.to_excel(writer, sheet_name="CompactSummary", index=False)
         weekday_plan_df.to_excel(writer, sheet_name="WeekdayPlan", index=False)
         visited_state_df.to_excel(writer, sheet_name="VisitedStates", index=False)
+
+        for weekday, freq_table_df in frequency_tables_by_weekday.items():
+            sheet_name = f"Freq_{weekday[:3]}"
+            freq_table_df.to_excel(writer, sheet_name=sheet_name, index=False)
     
 
     plot_policy_heatmap_avg_order(policy_df, PLOTS_DIR / "heatmap_avg_order.png")
     plot_policy_heatmap_weighted_order(policy_df,PLOTS_DIR / "heatmap_weighted_order.png")
     plot_stationary_probability_by_stock(policy_df,PLOTS_DIR / "heatmap_stationary_probability.png")
-    plot_policy_scatter_all_states(policy_df,PLOTS_DIR / "scatter_all_states.png")
-    plot_policy_scatter_weighted_states(policy_df,PLOTS_DIR / "scatter_weighted_states.png")
     plot_order_distribution_by_weekday(policy_df,PLOTS_DIR / "order_distribution_by_weekday.png")
+
+    if PLOT_FREQUENCY_TABLES:
+        for weekday, freq_table_df in frequency_tables_by_weekday.items():
+            plot_book_style_frequency_table(
+                table_df=freq_table_df,
+                weekday=weekday,
+                output_path=PLOTS_DIR / f"frequency_table_{weekday.lower()}.png",
+                scale=FREQUENCY_TABLE_SCALE,
+            )
 
     print("\nOPTIMAL LONG-RUN COST")
     print(f"Per day:   {g_star:.6f}")
