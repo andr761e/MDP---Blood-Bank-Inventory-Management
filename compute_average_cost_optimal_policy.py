@@ -508,7 +508,9 @@ def solve_average_cost_lp(
 
     for s in states:
         for a in actions_by_state[s]:
-            dist, cost = transition_distribution_and_expected_cost(s, a, demand_pmf, shelf_life)
+            dist, cost = transition_distribution_and_expected_cost(
+                s, a, demand_pmf, shelf_life
+            )
             transitions[(s, a)] = dist
             expected_cost[(s, a)] = cost
 
@@ -517,22 +519,36 @@ def solve_average_cost_lp(
 
     g = model.addVar(lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="g")
     h = {
-        s: model.addVar(lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name=f"h_{state_index[s]}")
+        s: model.addVar(
+            lb=-GRB.INFINITY,
+            vtype=GRB.CONTINUOUS,
+            name=f"h_{state_index[s]}"
+        )
         for s in states
     }
+
+    # Anchor the relative value function.
+    # Without this, h is only identified up to an additive constant.
+    # This does not change the optimal average cost or the optimal policy.
+    model.addConstr(h[states[0]] == 0.0, name="anchor_relative_value")
 
     for s in states:
         for a in actions_by_state[s]:
             rhs = expected_cost[(s, a)] + gp.quicksum(
                 p * h[ns] for ns, p in transitions[(s, a)].items()
             )
-            model.addConstr(g + h[s] <= rhs, name=f"acoe_{state_index[s]}_{a}")
+            model.addConstr(
+                g + h[s] <= rhs,
+                name=f"acoe_{state_index[s]}_{a}"
+            )
 
     model.setObjective(g, GRB.MAXIMIZE)
     model.optimize()
 
     if model.Status != GRB.OPTIMAL:
-        raise RuntimeError(f"Gurobi did not find an optimal solution. Status = {model.Status}")
+        raise RuntimeError(
+            f"Gurobi did not find an optimal solution. Status = {model.Status}"
+        )
 
     g_star = float(g.X)
     h_star = {s: float(h[s].X) for s in states}
@@ -542,6 +558,7 @@ def solve_average_cost_lp(
 
     for s in states:
         scores = {}
+
         for a in actions_by_state[s]:
             score = expected_cost[(s, a)] + sum(
                 p * h_star[ns] for ns, p in transitions[(s, a)].items()
@@ -549,7 +566,12 @@ def solve_average_cost_lp(
             scores[a] = score
 
         min_score = min(scores.values())
-        best_actions = [a for a, val in scores.items() if abs(val - min_score) <= REDUCED_COST_TOL]
+        best_actions = [
+            a for a, val in scores.items()
+            if abs(val - min_score) <= REDUCED_COST_TOL
+        ]
+
+        # If several actions are numerically tied, choose the smallest order quantity.
         chosen_action = min(best_actions)
         det_policy[s] = chosen_action
 
@@ -561,11 +583,14 @@ def solve_average_cost_lp(
             "num_tied_best_actions": len(best_actions),
             "tied_best_actions": str(best_actions),
         }
+
         for i in range(len(s) - 1):
             row[f"x{i+1}"] = s[i+1]
+
         policy_rows.append(row)
 
     policy_df = pd.DataFrame(policy_rows)
+
     return g_star, det_policy, policy_df
 
 
