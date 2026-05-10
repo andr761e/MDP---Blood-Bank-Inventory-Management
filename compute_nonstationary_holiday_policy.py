@@ -1522,7 +1522,15 @@ def plot_order_distribution_by_stage_weighted(
     calendar_df: pd.DataFrame,
     output_path: Path,
 ) -> None:
+    """
+    Plot P(optimal_order = a | stage) as a stacked bar chart.
+
+    The colors use a sequential gradient based on order size instead of treating
+    order sizes as unrelated categorical colors. This avoids repeated colors when
+    many different order sizes occur.
+    """
     df = add_policy_plot_columns(policy_df)
+
     dist = (
         df.groupby(["t", "optimal_order"])["occupancy_probability"]
         .sum()
@@ -1530,7 +1538,8 @@ def plot_order_distribution_by_stage_weighted(
     )
 
     totals = dist.groupby("t")["mass"].transform("sum")
-    dist["conditional_mass"] = dist["mass"] / totals
+    dist["conditional_mass"] = dist["mass"] / totals.replace(0.0, np.nan)
+    dist["conditional_mass"] = dist["conditional_mass"].fillna(0.0)
 
     pivot = (
         dist.pivot(index="t", columns="optimal_order", values="conditional_mass")
@@ -1538,13 +1547,34 @@ def plot_order_distribution_by_stage_weighted(
         .reindex(range(HORIZON_DAYS), fill_value=0.0)
     )
 
+    # Keep only order sizes that actually occur.
+    used_orders = [col for col in pivot.columns if pivot[col].sum() > 1e-12]
+    pivot = pivot[used_orders]
+
     fig, ax = plt.subplots(figsize=(16, 6))
+
     bottom = np.zeros(len(pivot))
     x = np.arange(len(pivot))
 
+    # Colorblind-friendly sequential colormap.
+    cmap = plt.get_cmap("cividis")
+
+    # Fixed scale, so the same order size has the same color across plots.
+    norm = plt.Normalize(vmin=0, vmax=MAX_ORDER)
+
     for order in pivot.columns:
         values = pivot[order].to_numpy()
-        ax.bar(x, values, bottom=bottom, label=f"Order {order}", width=0.85)
+
+        ax.bar(
+            x,
+            values,
+            bottom=bottom,
+            width=0.85,
+            color=cmap(norm(float(order))),
+            edgecolor="white",
+            linewidth=0.25,
+        )
+
         bottom += values
 
     _shade_nonproduction_days(ax, calendar_df)
@@ -1553,16 +1583,24 @@ def plot_order_distribution_by_stage_weighted(
         f"{int(row.t)}\n{str(row.weekday)[:3]}\n{str(row.date)[5:]}"
         for row in calendar_df.itertuples(index=False)
     ]
+
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8)
     ax.set_xlabel("Stage / date")
     ax.set_ylabel("Conditional probability")
-    ax.set_ylim(0, 1)
-    ax.set_title("Distribution of optimal orders conditional on stage")
-    ax.legend(title="Order size", bbox_to_anchor=(1.01, 1.0), loc="upper left", ncol=2, fontsize=8)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Conditional distribution of optimal order size by stage")
+
+    # Replace the huge categorical legend with a colorbar.
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+
+    cbar = fig.colorbar(sm, ax=ax)
+    cbar.set_label("Order size")
+    cbar.set_ticks(np.arange(0, MAX_ORDER + 1, 5))
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 

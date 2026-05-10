@@ -27,7 +27,7 @@ MAX_ORDER = 35                 # Max order quantity allowed (9)
 PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
 
 # Costs
-C_OUTDATE = 2410.0                # c_0
+C_OUTDATE = 2410.0               # c_0
 C_SHORTAGE = 20000.0              # c_s
 C_HOLDING = 5.0                   # c_H
 C_PRODUCTION = 2410.0             # Optional cost for production (keep at 0 for now)
@@ -1033,8 +1033,8 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
     For each weekday, the stacked bar sums to 1:
         P(optimal_order = a | weekday)
 
-    This is more interpretable than plotting unconditional stationary probability mass,
-    because the plot then compares order distributions within each weekday.
+    The colors use a sequential color scale based on order size instead of
+    treating order sizes as unrelated categories.
     """
 
     dist_df = (
@@ -1050,7 +1050,6 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
 
     # Convert unconditional stationary mass into conditional mass given weekday.
     row_sums = pivot_df.sum(axis=1)
-
     pivot_df = pivot_df.div(row_sums.replace(0.0, np.nan), axis=0).fillna(0.0)
 
     # Keep only order sizes that actually occur with positive conditional mass.
@@ -1060,32 +1059,45 @@ def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Pat
     x = np.arange(len(pivot_df.index))
     bottom = np.zeros(len(pivot_df.index))
 
-    plt.figure(figsize=(14, 7))
+    plt.figure(figsize=(11, 6))
+
+    # Colorblind-friendly sequential colormap.
+    cmap = plt.get_cmap("cividis")
+
+    # Important: use the full possible action range so colors are comparable
+    # across different scenarios and plots.
+    norm = plt.Normalize(vmin=0, vmax=MAX_ORDER)
 
     for order_val in pivot_df.columns:
         vals = pivot_df[order_val].to_numpy()
-        plt.bar(x, vals, bottom=bottom, label=f"Order {order_val}")
+
+        plt.bar(
+            x,
+            vals,
+            bottom=bottom,
+            color=cmap(norm(order_val)),
+            edgecolor="white",
+            linewidth=0.35,
+        )
+
         bottom += vals
 
-    plt.xticks(x, pivot_df.index, rotation=45)
+    plt.xticks(x, pivot_df.index, rotation=45, ha="right")
     plt.xlabel("Weekday")
     plt.ylabel("Conditional probability")
     plt.ylim(0.0, 1.0)
-    plt.title("Distribution of optimal orders conditional on weekday")
+    plt.title("Conditional distribution of optimal order size by weekday")
 
-    n_orders = len(pivot_df.columns)
-    ncol = min(4, max(1, int(np.ceil(n_orders / 8))))
+    # Replace the huge categorical legend with a colorbar.
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
 
-    plt.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
-        ncol=ncol,
-        borderaxespad=0.0,
-        title="Order size"
-    )
+    cbar = plt.colorbar(sm, ax=plt.gca())
+    cbar.set_label("Order size")
+    cbar.set_ticks(np.arange(0, MAX_ORDER + 1, 5))
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.savefig(output_path, dpi=250, bbox_inches="tight")
     plt.close()
 
 
