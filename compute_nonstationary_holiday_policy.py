@@ -556,7 +556,9 @@ def solve_stationary_average_cost_lp_for_terminal_values(
 
     for s in states:
         for a in actions_by_state[s]:
-            dist, cost = transition_distribution_and_expected_cost_regular(s, a, demand_pmf, SHELF_LIFE)
+            dist, cost = transition_distribution_and_expected_cost_regular(
+                s, a, demand_pmf, SHELF_LIFE
+            )
             transitions[(s, a)] = dist
             expected_cost[(s, a)] = cost
 
@@ -565,34 +567,57 @@ def solve_stationary_average_cost_lp_for_terminal_values(
 
     g = model.addVar(lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="g")
     h = {
-        s: model.addVar(lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name=f"h_{state_index[s]}")
+        s: model.addVar(
+            lb=-GRB.INFINITY,
+            vtype=GRB.CONTINUOUS,
+            name=f"h_{state_index[s]}"
+        )
         for s in states
     }
+
+    # Anchor the relative value function.
+    # Without this, h is only identified up to an additive constant.
+    # This does not change g_star or the optimal policy.
+    model.addConstr(h[states[0]] == 0.0, name="anchor_relative_value")
 
     for s in states:
         for a in actions_by_state[s]:
             rhs = expected_cost[(s, a)] + gp.quicksum(
                 p * h[ns] for ns, p in transitions[(s, a)].items()
             )
-            model.addConstr(g + h[s] <= rhs, name=f"acoe_{state_index[s]}_{a}")
+            model.addConstr(
+                g + h[s] <= rhs,
+                name=f"acoe_{state_index[s]}_{a}"
+            )
 
     model.setObjective(g, GRB.MAXIMIZE)
     model.optimize()
 
     if model.Status != GRB.OPTIMAL:
-        raise RuntimeError(f"Gurobi did not find an optimal stationary solution. Status = {model.Status}")
+        raise RuntimeError(
+            f"Gurobi did not find an optimal stationary solution. Status = {model.Status}"
+        )
 
     g_star = float(g.X)
     h_star = {s: float(h[s].X) for s in states}
 
     det_policy: Dict[State, int] = {}
+
     for s in states:
         scores = {}
+
         for a in actions_by_state[s]:
-            score = expected_cost[(s, a)] + sum(p * h_star[ns] for ns, p in transitions[(s, a)].items())
+            score = expected_cost[(s, a)] + sum(
+                p * h_star[ns] for ns, p in transitions[(s, a)].items()
+            )
             scores[a] = score
+
         min_score = min(scores.values())
-        best_actions = [a for a, val in scores.items() if abs(val - min_score) <= REDUCED_COST_TOL]
+        best_actions = [
+            a for a, val in scores.items()
+            if abs(val - min_score) <= REDUCED_COST_TOL
+        ]
+
         det_policy[s] = min(best_actions)
 
     return g_star, h_star, det_policy
