@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 
 from itertools import product
 from pathlib import Path
@@ -494,6 +495,38 @@ def build_average_cost_breakdown_under_policy(
 # SOLVE AVERAGE-COST MDP BY DUAL LINEAR PROGRAM
 # ============================================================
 
+def make_progress_printer(total: int, label: str, step_percent: int = 10):
+    """
+    Print progress at 10%, 20%, ..., 100%.
+    Works for loops where the total number of iterations is known.
+    """
+    start_time = time.perf_counter()
+    next_mark = step_percent
+
+    def report(done: int):
+        nonlocal next_mark
+
+        if total <= 0:
+            return
+
+        percent = int(100 * done / total)
+
+        if percent >= next_mark or done == total:
+            elapsed = time.perf_counter() - start_time
+            print(
+                f"{label}: {min(percent, 100)}% done "
+                f"({done:,}/{total:,}) | elapsed: {elapsed:.1f}s",
+                flush=True,
+            )
+
+            while next_mark <= percent:
+                next_mark += step_percent
+
+            if done == total:
+                next_mark = 101
+
+    return report
+
 # Formulate and solve the dual linear program for the average-cost MDP. Then extract the optimal average cost and a deterministic stationary policy. Also create a DataFrame summarizing the policy for each state. The dual LP has a variable g representing the average cost and variables h[s] representing the relative value function for each state. The constraints ensure that g + h[s] <= expected_cost(s,a) + sum_{s'} P(s'|s,a) h[s'] for all states s and actions a. After solving the LP, we extract the optimal policy by choosing the action that minimizes the right-hand side of the constraint for each state, using the optimal h values. We also create a DataFrame that includes the weekday, total stock, optimal order, Bellman minimum value, number of tied best actions, and the list of tied best actions for each state.
 def solve_average_cost_lp(
     states: List[State],
@@ -502,10 +535,26 @@ def solve_average_cost_lp(
     shelf_life: int,
 ):
     state_index = {s: i for i, s in enumerate(states)}
+    total_state_action_pairs = sum(len(actions) for actions in actions_by_state.values())
+
+    print("\nStarting solve_average_cost_lp")
+    print(f"Number of states:           {len(states):,}")
+    print(f"Number of state-action pairs: {total_state_action_pairs:,}")
+    print("-" * 72, flush=True)
 
     transitions = {}
     expected_cost = {}
 
+    # ------------------------------------------------------------
+    # 1. Build transitions and expected costs
+    # ------------------------------------------------------------
+    print("[1/4] Building transition distributions and expected costs...", flush=True)
+    progress = make_progress_printer(
+        total_state_action_pairs,
+        "[1/4] Transition building",
+    )
+
+    done = 0
     for s in states:
         for a in actions_by_state[s]:
             dist, cost = transition_distribution_and_expected_cost(
@@ -514,8 +563,21 @@ def solve_average_cost_lp(
             transitions[(s, a)] = dist
             expected_cost[(s, a)] = cost
 
+            done += 1
+            progress(done)
+
+    print("[1/4] Transition building complete.", flush=True)
+
+    # ------------------------------------------------------------
+    # 2. Build Gurobi model
+    # ------------------------------------------------------------
+    print("[2/4] Building Gurobi LP model...", flush=True)
+
     model = gp.Model("average_cost_dual_lp")
-    model.Params.OutputFlag = 0
+
+    # Set this to 1 if you want Gurobi's own internal log.
+    # It does not give exact percentage progress, but it shows iterations.
+    model.Params.OutputFlag = 1
 
     g = model.addVar(lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="g")
     h = {
@@ -529,9 +591,14 @@ def solve_average_cost_lp(
 
     # Anchor the relative value function.
     # Without this, h is only identified up to an additive constant.
-    # This does not change the optimal average cost or the optimal policy.
     model.addConstr(h[states[0]] == 0.0, name="anchor_relative_value")
 
+    progress = make_progress_printer(
+        total_state_action_pairs,
+        "[2/4] Constraint building",
+    )
+
+    done = 0
     for s in states:
         for a in actions_by_state[s]:
             rhs = expected_cost[(s, a)] + gp.quicksum(
@@ -542,8 +609,31 @@ def solve_average_cost_lp(
                 name=f"acoe_{state_index[s]}_{a}"
             )
 
+            done += 1
+            progress(done)
+
     model.setObjective(g, GRB.MAXIMIZE)
+
+    print("[2/4] LP model construction complete.", flush=True)
+    print(
+        f"Model has approximately {len(states):,} h-variables, "
+        f"1 g-variable, and {total_state_action_pairs:,} Bellman constraints.",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------
+    # 3. Optimize
+    # ------------------------------------------------------------
+    print("[3/4] Optimizing LP with Gurobi...", flush=True)
+    print(
+        "Note: Gurobi cannot honestly report exact 10%, 20%, ... progress "
+        "because the number of optimizer iterations is not known in advance.",
+        flush=True,
+    )
+
+    solve_start = time.perf_counter()
     model.optimize()
+    solve_time = time.perf_counter() - solve_start
 
     if model.Status != GRB.OPTIMAL:
         raise RuntimeError(
@@ -553,10 +643,26 @@ def solve_average_cost_lp(
     g_star = float(g.X)
     h_star = {s: float(h[s].X) for s in states}
 
+    print(
+        f"[3/4] Gurobi optimization complete. "
+        f"g* = {g_star:.6f}. Time: {solve_time:.1f}s",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------
+    # 4. Extract deterministic policy
+    # ------------------------------------------------------------
+    print("[4/4] Extracting deterministic policy...", flush=True)
+
     det_policy = {}
     policy_rows = []
 
-    for s in states:
+    progress = make_progress_printer(
+        len(states),
+        "[4/4] Policy extraction",
+    )
+
+    for state_counter, s in enumerate(states, start=1):
         scores = {}
 
         for a in actions_by_state[s]:
@@ -589,7 +695,12 @@ def solve_average_cost_lp(
 
         policy_rows.append(row)
 
+        progress(state_counter)
+
     policy_df = pd.DataFrame(policy_rows)
+
+    print("[4/4] Policy extraction complete.", flush=True)
+    print("solve_average_cost_lp finished.\n", flush=True)
 
     return g_star, det_policy, policy_df
 

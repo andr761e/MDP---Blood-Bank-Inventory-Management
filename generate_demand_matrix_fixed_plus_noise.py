@@ -11,7 +11,7 @@ import pandas as pd
 
 # Demand is measured in platelet pools before scaling.
 # If units_per_model_unit = 2, then 1 model unit corresponds to 2 platelet pools.
-units_per_model_unit = 1
+units_per_model_unit = 1.25
 
 # AUH 2025 demand data: Monday, Tuesday, ..., Sunday.
 calendar_year = 2025
@@ -29,7 +29,7 @@ annual_weekday_demands = [
 # Example: if the weekday base demand is 15 and max_noise = 10,
 # then demand is supported on {10, 11, ..., 20}.
 # Equivalently, the signed deviation is {-5, -4, ..., 5} when max_noise is even.
-max_noise = 10
+max_noise = 4
 
 # If True, lambda is fitted so the shifted truncated Poisson has exactly the
 # empirical weekday mean. This avoids systematically adding demand.
