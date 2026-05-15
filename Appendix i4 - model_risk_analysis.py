@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 # Reuse the model, LP solver, evaluation tools and plot functions from your main script.
 # This file should be placed in the same folder as compute_average_cost_optimal_policy.py.
-from Appendix_A2_compute_average_cost_optimal_policy import (
+from Appendix_i2_compute_average_cost_optimal_policy import (
     # Parameters
     SHELF_LIFE,
     INVENTORY_CAP,
@@ -54,16 +54,16 @@ from Appendix_A2_compute_average_cost_optimal_policy import (
 # ============================================================
 
 # Baseline/assumed demand. Keep this name exactly as in your current workflow.
-ASSUMED_DEMAND_XLSX_PATH = Path("Appendix B1 - weekday_demand_probabilities.xlsx")
+ASSUMED_DEMAND_XLSX_PATH = Path("Appendix ii1 - weekday_demand_probabilities.xlsx")
 ASSUMED_SCENARIO_NAME = "baseline"
 
 # True demand scenario used for model-risk evaluation.
 # Generate this with a separate demand generator, e.g. generate_demand_matrix_plus10.py.
-TRUE_DEMAND_XLSX_PATH = Path("Appendix B2 - weekday_demand_probabilities_plus10.xlsx")
+TRUE_DEMAND_XLSX_PATH = Path("Appendix ii2 - weekday_demand_probabilities_plus10.xlsx")
 TRUE_SCENARIO_NAME = "plus10"
 
 # Output folders/files
-OUTPUT_DIR = Path("Appendix C - data/Appendix C3 - Model risk")
+OUTPUT_DIR = Path("Appendix iii - data/Appendix iii3 - Model risk")
 OUTPUT_XLSX_PATH = OUTPUT_DIR / f"model_risk_{ASSUMED_SCENARIO_NAME}_policy_under_{TRUE_SCENARIO_NAME}.xlsx"
 PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 

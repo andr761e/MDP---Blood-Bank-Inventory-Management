@@ -37,9 +37,9 @@ fit_lambda_to_centered_mean = True
 
 # Output used by the policy scripts.
 if demand_multiplier == 1.00:
-    output_path = "Appendix B1 - weekday_demand_probabilities.xlsx"
+    output_path = "Appendix ii1 - weekday_demand_probabilities.xlsx"
 else:
-    output_path = "Appendix B2 - weekday_demand_probabilities_plus10.xlsx"
+    output_path = "Appendix ii2 - weekday_demand_probabilities_plus10.xlsx"
 
 
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]

@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 # ============================================================
 
 # The path to the Excel file containing demand probabilities. Create this file first using the demand-matrix generator script.   
-DEMAND_XLSX_PATH = Path("Appendix B1 - weekday_demand_probabilities.xlsx")
+DEMAND_XLSX_PATH = Path("Appendix ii1 - weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters
@@ -35,7 +35,7 @@ C_PRODUCTION = 2410.0             # c_P
 
 # Output file name
 # Output folders/files
-OUTPUT_DIR = Path("Appendix C - data/Appendix C1 - Stationary")
+OUTPUT_DIR = Path("Appendix iii - data/Appendix iii1 - Stationary")
 OUTPUT_XLSX_PATH = OUTPUT_DIR / "optimal_stationary_policy_lp_v2.xlsx"
 PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 

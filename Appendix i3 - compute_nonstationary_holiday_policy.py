@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 # ============================================================
 
 # Same demand file as in the stationary model.
-DEMAND_XLSX_PATH = Path("Appendix B1 - weekday_demand_probabilities.xlsx")
+DEMAND_XLSX_PATH = Path("Appendix ii1 - weekday_demand_probabilities.xlsx")
 DEMAND_SHEET_NAME = "DemandProbabilities"
 
 # Model parameters.
@@ -36,7 +36,7 @@ C_HOLDING = 5.0
 C_PRODUCTION = 2410.0
 
 # Output folders/files.
-OUTPUT_DIR = Path("Appendix C - data/Appendix C2 - Non-stationary")
+OUTPUT_DIR = Path("Appendix iii - data/Appendix iii2 - Non-stationary")
 OUTPUT_XLSX_PATH = OUTPUT_DIR / "optimal_nonstationary_christmas_policy.xlsx"
 PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
 
