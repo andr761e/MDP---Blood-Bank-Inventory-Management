@@ -1,0 +1,1428 @@
+from __future__ import annotations
+import time
+
+from itertools import product
+from pathlib import Path
+from typing import Dict, List, Tuple
+from collections import deque
+
+import gurobipy as gp
+import numpy as np
+import pandas as pd
+from gurobipy import GRB
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# USER PARAMETERS
+# ============================================================
+
+# The path to the Excel file containing demand probabilities. Create this file first using the demand-matrix generator script.   
+DEMAND_XLSX_PATH = Path("Appendix B1 - weekday_demand_probabilities.xlsx")
+DEMAND_SHEET_NAME = "DemandProbabilities"
+
+# Model parameters
+SHELF_LIFE = 5                # platelet shelf life from purchase
+INVENTORY_CAP = 50            # Max total inventory allowed
+MAX_ORDER = 35                 # Max order quantity allowed
+PRODUCTION_DAYS = {0, 1, 2, 3, 4}   # Production days (0=Monday, 1=Tuesday, ..., 6=Sunday)
+
+# Costs
+C_OUTDATE = 2410.0               # c_0
+C_SHORTAGE = 20000.0              # c_s
+C_HOLDING = 5.0                   # c_H
+C_PRODUCTION = 2410.0             # c_P
+
+# Output file name
+# Output folders/files
+OUTPUT_DIR = Path("Appendix C - data/Appendix C1 - Stationary")
+OUTPUT_XLSX_PATH = OUTPUT_DIR / "optimal_stationary_policy_lp_v2.xlsx"
+PLOTS_DIR = OUTPUT_DIR / "plots_and_tables"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Numerical tolerances
+REDUCED_COST_TOL = 1e-8
+PRINT_TOP_ROWS = 30
+
+# Frequency-table settings. These tables mimic the state-action frequency
+# tables in Haijema et al. Chapter 10, but use exact stationary probabilities
+# rather than Monte Carlo simulation. Each weekday table is scaled to this
+# many pseudo-observations conditional on that weekday.
+FREQUENCY_TABLE_SCALE = 1_000_000
+PLOT_FREQUENCY_TABLES = True
+
+
+
+# WEEKSDAYS
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+# ============================================================
+# INPUT: DEMAND PROBABILITIES
+# ============================================================
+
+# Opens excel file, finds demand columns, checks for missing weekdays, normalizes probabilities, and returns them as a numpy array. 
+def load_demand_probabilities(path: Path, sheet_name: str) -> tuple[np.ndarray, int]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Demand file not found: {path}\n"
+            "Create it first with the demand-matrix generator script."
+        )
+
+    df = pd.read_excel(path, sheet_name=sheet_name, index_col=0)
+    df.index = [str(x).strip() for x in df.index]
+
+    demand_cols = [c for c in df.columns if str(c).startswith("demand_")]
+    if not demand_cols:
+        raise ValueError("No columns named demand_0, demand_1, ... found in the Excel file.")
+
+    demand_cols = sorted(demand_cols, key=lambda x: int(str(x).split("_")[1]))
+    missing_days = [d for d in WEEKDAYS if d not in df.index]
+    if missing_days:
+        raise ValueError(f"Missing weekday rows in Excel file: {missing_days}")
+
+    df = df.loc[WEEKDAYS, demand_cols].astype(float)
+    arr = df.to_numpy()
+
+    if np.any(arr < -1e-12):
+        raise ValueError("Demand probabilities must be nonnegative.")
+
+    row_sums = arr.sum(axis=1)
+    if np.any(row_sums <= 0):
+        raise ValueError("Each weekday row must have positive total probability.")
+
+    arr = arr / row_sums[:, None]
+    K = len(demand_cols) - 1
+    return arr, K
+
+
+# ============================================================
+# STATE AND ACTION SPACE
+# ============================================================
+
+State = Tuple[int, ...] # Inventory vector (x_0, x_1, ..., x_{M-1}) 
+
+#Enumarate all inventory vectors with total inventory <= cap (INVENTORY_CAP). This is used to build the state space of the MDP, which consists of (day, inventory vector) pairs. The inventory vector tracks how many units have 1 day left, 2 days left, ..., up to shelf_life-1 days left. The total inventory is the sum of these components and must be <= INVENTORY_CAP.
+def all_inventory_vectors(cap: int, dims: int):
+    for vec in product(range(cap + 1), repeat=dims):
+        if sum(vec) <= cap:
+            yield vec
+
+
+# Enumerate all states (day, inventory vector) with total inventory <= cap (INVENTORY_CAP). The day component cycles through 0 to 6 (Monday to Sunday), and the inventory vector tracks how many units have 1 day left, 2 days left, ..., up to shelf_life-1 days left. The total inventory is the sum of these components and must be <= INVENTORY_CAP.
+def enumerate_states(inventory_cap: int, shelf_life: int) -> List[State]:
+    states = []
+    for day in range(7):
+        for inv in all_inventory_vectors(inventory_cap, shelf_life - 1):
+            states.append((day,) + tuple(inv))
+    return states
+
+# Given a state, return the list of feasible actions (order quantities) that respect the inventory cap and production constraints. The state includes the current day and inventory vector, which allows us to determine if production is possible on that day and how much we can order without exceeding the inventory cap. If it's not a production day, the only feasible action is to order 0.
+def feasible_actions(
+    state: State,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+) -> List[int]:
+    day = state[0]
+    current_stock = sum(state[1:])
+
+    if day not in production_days:
+        return [0]
+
+    max_feasible = min(max_order, inventory_cap - current_stock)
+    return list(range(max_feasible + 1))
+
+
+def extract_min_demand_by_day(demand_pmf: np.ndarray, tol: float = 1e-12) -> Dict[int, int]:
+    """
+    For each weekday d, return the smallest demand k with positive probability.
+    """
+    min_demand_by_day: Dict[int, int] = {}
+
+    for day in range(demand_pmf.shape[0]):
+        positive_demands = np.where(demand_pmf[day, :] > tol)[0]
+        if len(positive_demands) == 0:
+            raise ValueError(f"No positive-demand support found for weekday index {day}.")
+        min_demand_by_day[day] = int(positive_demands[0])
+
+    return min_demand_by_day
+
+def compute_max_total_inventory_by_day(min_demand_by_day: Dict[int, int]) -> Dict[int, int]:
+    """
+    Compute a safe upper bound on total inventory at the start of each weekday.
+
+    Logic:
+    Work backwards from the target day until the most recent production day.
+    Starting from INVENTORY_CAP on that production day (after ordering),
+    subtract the minimum demand for each intervening day up to the day before
+    the target day.
+    """
+    max_total_by_day: Dict[int, int] = {}
+
+    for target_day in range(7):
+        days_to_subtract = []
+
+        current = (target_day - 1) % 7
+        while True:
+            days_to_subtract.append(current)
+            if current in PRODUCTION_DAYS:
+                break
+            current = (current - 1) % 7
+
+        bound = INVENTORY_CAP - sum(min_demand_by_day[d] for d in days_to_subtract)
+        max_total_by_day[target_day] = max(0, bound)
+
+    return max_total_by_day
+
+
+
+# Check if a state is structurally feasible given the production constraints. For example, on Monday (day=0), we cannot have any inventory with 3 or 4 days of shelf life remaining, because that would imply production on Saturday or Sunday, which is not allowed. Similarly, on Tuesday (day=1), we cannot have inventory with 3 days of shelf life remaining, and on Sunday (day=6), we cannot have inventory with 4 days of shelf life remaining. This function can be used to filter out states that are impossible to reach under the given production schedule.
+def structurally_feasible_state(
+    state: State,
+    max_total_by_day: Dict[int, int],
+) -> bool:
+    day = state[0]
+    inv = state[1:]
+    total_stock = sum(inv)
+
+    # No single age bucket can exceed one day's production
+    if any(x > MAX_ORDER for x in inv):
+        return False
+
+    # Dynamic upper bound on total stock from minimum-demand support
+    if total_stock > max_total_by_day[day]:
+        return False
+
+    # General production-day logic:
+    # x_r at day d can only be positive if production was possible
+    # exactly (SHELF_LIFE - r) days earlier.
+    #
+    # inv[0] = x1, inv[1] = x2, ..., inv[SHELF_LIFE-2] = x_{SHELF_LIFE-1}
+    for idx, x in enumerate(inv):
+        r = idx + 1
+        days_back = SHELF_LIFE - r
+        origin_day = (day - days_back) % 7
+
+        if x > 0 and origin_day not in PRODUCTION_DAYS:
+            return False
+
+    return True
+
+def positive_demand_values_by_day(demand_pmf: np.ndarray, tol: float = 1e-12):
+    return {
+        day: [int(k) for k, p in enumerate(demand_pmf[day, :]) if p > tol]
+        for day in range(demand_pmf.shape[0])
+    }
+
+
+def reachable_state_filter(
+    candidate_states: List[State],
+    demand_pmf: np.ndarray,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+    shelf_life: int,
+    initial_states: List[State],
+) -> List[State]:
+
+    candidate_set = set(candidate_states)
+    positive_demands = positive_demand_values_by_day(demand_pmf)
+
+    reachable = set()
+    queue = deque()
+
+    for s in initial_states:
+        if s in candidate_set:
+            reachable.add(s)
+            queue.append(s)
+
+    while queue:
+        s = queue.popleft()
+        day = s[0]
+
+        for a in feasible_actions(s, inventory_cap, max_order, production_days):
+            for demand in positive_demands[day]:
+                ns, _, _, _ = step_dynamics(
+                    state=s,
+                    action=a,
+                    demand=demand,
+                    shelf_life=shelf_life,
+                )
+
+                if ns in candidate_set and ns not in reachable:
+                    reachable.add(ns)
+                    queue.append(ns)
+
+    return sorted(reachable)
+
+
+def assert_transition_closed(
+    states: List[State],
+    demand_pmf: np.ndarray,
+    inventory_cap: int,
+    max_order: int,
+    production_days: set[int],
+    shelf_life: int,
+) -> None:
+
+    state_set = set(states)
+    positive_demands = positive_demand_values_by_day(demand_pmf)
+
+    for s in states:
+        day = s[0]
+
+        for a in feasible_actions(s, inventory_cap, max_order, production_days):
+            for demand in positive_demands[day]:
+                ns, _, _, _ = step_dynamics(
+                    state=s,
+                    action=a,
+                    demand=demand,
+                    shelf_life=shelf_life,
+                )
+
+                if ns not in state_set:
+                    raise ValueError(
+                        f"Pruned state space is not transition-closed.\n"
+                        f"State: {s}\n"
+                        f"Action: {a}\n"
+                        f"Demand: {demand}\n"
+                        f"Next state: {ns}"
+                    )
+
+# ============================================================
+# DYNAMICS: ACTION -> DEMAND -> FIFO -> AGEING
+# ============================================================
+
+# State observed at the start of the day, action taken, new units in, demand realized, then FIFO and ageing happen to get next state and costs. The state is a tuple where the first element is the day of the week (0=Monday, ..., 6=Sunday) and the remaining elements represent the inventory vector (x_1, x_2, ..., x_{m-1}), where x_i is the number of units with i days of shelf life remaining. The action is the order quantity placed at the start of the day. The demand is a random variable that will be realized after the action. The function computes the next state after applying FIFO (first-in-first-out) to meet demand and then ageing (decreasing shelf life by 1 day). It also calculates the shortage, outdate, and holding costs incurred during this transition.
+def step_dynamics(
+    state: State,
+    action: int,
+    demand: int,
+    shelf_life: int,
+) -> tuple[State, float, float, float]:
+    day = state[0]
+    inv = list(state[1:])
+
+    stock = inv + [action]   # fresh stock enters with shelf_life days remaining
+    remaining_demand = demand
+    remaining_stock = stock[:]
+
+    # FIFO = oldest first
+    for i in range(shelf_life):
+        used = min(remaining_stock[i], remaining_demand)
+        remaining_stock[i] -= used
+        remaining_demand -= used
+
+    shortage = float(remaining_demand)
+    outdate = float(remaining_stock[0])
+
+    next_inv = tuple(remaining_stock[1:])
+    next_day = (day + 1) % 7
+    next_state = (next_day,) + next_inv
+
+    holding = float(sum(next_inv))
+    return next_state, shortage, outdate, holding
+
+# Given a state and action, compute the distribution over next states and the expected cost by integrating over the demand probabilities. The demand probabilities depend on the current day of the week, which is part of the state. For each possible demand realization, we use the step_dynamics function to find the next state and compute the cost incurred (outdate cost, shortage cost, holding cost, and production cost). We then aggregate these to get the overall distribution of next states and the expected cost for taking that action in the given state.
+def transition_distribution_and_expected_cost(
+    state: State,
+    action: int,
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+) -> tuple[Dict[State, float], float]:
+    day = state[0]
+    probs = demand_pmf[day, :]
+
+    dist: Dict[State, float] = {}
+    expected_cost = 0.0
+
+    for demand, p in enumerate(probs):
+        if p <= 1e-12:
+            continue
+
+        next_state, shortage, outdate, holding = step_dynamics(state, action, demand, shelf_life)
+        cost = (
+            C_OUTDATE * outdate
+            + C_SHORTAGE * shortage
+            + C_HOLDING * holding
+            + C_PRODUCTION * action
+        )
+        dist[next_state] = dist.get(next_state, 0.0) + float(p)
+        expected_cost += float(p) * cost
+
+    return dist, expected_cost
+
+
+
+def expected_cost_components_under_action(
+    state: State,
+    action: int,
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+) -> Dict[str, float]:
+    """
+    Compute expected one-day units and cost components for a fixed state-action pair.
+
+    The expected unit quantities are computed directly from the transition dynamics.
+    This is more robust than recovering them by dividing costs by unit costs, since
+    some unit costs may be set to zero in experiments.
+    """
+    day = state[0]
+    probs = demand_pmf[day, :]
+
+    expected_shortage_units = 0.0
+    expected_outdate_units = 0.0
+    expected_holding_units = 0.0
+
+    for demand, p in enumerate(probs):
+        if p <= 1e-12:
+            continue
+
+        _, shortage, outdate, holding = step_dynamics(
+            state=state,
+            action=action,
+            demand=demand,
+            shelf_life=shelf_life,
+        )
+
+        expected_shortage_units += float(p) * shortage
+        expected_outdate_units += float(p) * outdate
+        expected_holding_units += float(p) * holding
+
+    expected_production_units = float(action)
+
+    return {
+        "holding_units": expected_holding_units,
+        "production_units": expected_production_units,
+        "outdate_units": expected_outdate_units,
+        "shortage_units": expected_shortage_units,
+        "holding_cost": C_HOLDING * expected_holding_units,
+        "production_cost": C_PRODUCTION * expected_production_units,
+        "outdate_cost": C_OUTDATE * expected_outdate_units,
+        "shortage_cost": C_SHORTAGE * expected_shortage_units,
+    }
+
+
+def build_average_cost_breakdown_under_policy(
+    states: List[State],
+    pi: np.ndarray,
+    det_policy: Dict[State, int],
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+) -> tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Compute the long-run average daily cost breakdown under a deterministic policy.
+
+    For each state s, we compute the expected one-day component costs under the
+    policy action pi_policy(s), and then weight by the stationary probability pi(s).
+    """
+    totals = {
+        "holding_units": 0.0,
+        "production_units": 0.0,
+        "outdate_units": 0.0,
+        "shortage_units": 0.0,
+        "holding_cost": 0.0,
+        "production_cost": 0.0,
+        "outdate_cost": 0.0,
+        "shortage_cost": 0.0,
+    }
+
+    for i, state in enumerate(states):
+        state_prob = float(pi[i])
+        if state_prob <= 1e-15:
+            continue
+
+        action = det_policy[state]
+        components = expected_cost_components_under_action(
+            state=state,
+            action=action,
+            demand_pmf=demand_pmf,
+            shelf_life=shelf_life,
+        )
+
+        for key in totals:
+            totals[key] += state_prob * components[key]
+
+    totals["total_cost"] = (
+        totals["holding_cost"]
+        + totals["production_cost"]
+        + totals["outdate_cost"]
+        + totals["shortage_cost"]
+    )
+
+    rows = []
+    component_specs = [
+        ("holding", C_HOLDING, "holding_units", "holding_cost"),
+        ("production", C_PRODUCTION, "production_units", "production_cost"),
+        ("outdate", C_OUTDATE, "outdate_units", "outdate_cost"),
+        ("shortage", C_SHORTAGE, "shortage_units", "shortage_cost"),
+    ]
+
+    for component, unit_cost, units_key, cost_key in component_specs:
+        avg_units_per_day = totals[units_key]
+        avg_cost_per_day = totals[cost_key]
+        rows.append({
+            "component": component,
+            "unit_cost": unit_cost,
+            "average_units_per_day": avg_units_per_day,
+            "average_units_per_week": 7.0 * avg_units_per_day,
+            "average_cost_per_day": avg_cost_per_day,
+            "average_cost_per_week": 7.0 * avg_cost_per_day,
+            "share_of_total_cost": (
+                avg_cost_per_day / totals["total_cost"]
+                if abs(totals["total_cost"]) > 1e-12
+                else np.nan
+            ),
+        })
+
+    rows.append({
+        "component": "total",
+        "unit_cost": np.nan,
+        "average_units_per_day": np.nan,
+        "average_units_per_week": np.nan,
+        "average_cost_per_day": totals["total_cost"],
+        "average_cost_per_week": 7.0 * totals["total_cost"],
+        "share_of_total_cost": 1.0,
+    })
+
+    return pd.DataFrame(rows), totals
+
+
+# ============================================================
+# SOLVE AVERAGE-COST MDP BY DUAL LINEAR PROGRAM
+# ============================================================
+
+def make_progress_printer(total: int, label: str, step_percent: int = 10):
+    """
+    Print progress at 10%, 20%, ..., 100%.
+    Works for loops where the total number of iterations is known.
+    """
+    start_time = time.perf_counter()
+    next_mark = step_percent
+
+    def report(done: int):
+        nonlocal next_mark
+
+        if total <= 0:
+            return
+
+        percent = int(100 * done / total)
+
+        if percent >= next_mark or done == total:
+            elapsed = time.perf_counter() - start_time
+            print(
+                f"{label}: {min(percent, 100)}% done "
+                f"({done:,}/{total:,}) | elapsed: {elapsed:.1f}s",
+                flush=True,
+            )
+
+            while next_mark <= percent:
+                next_mark += step_percent
+
+            if done == total:
+                next_mark = 101
+
+    return report
+
+# Formulate and solve the dual linear program for the average-cost MDP. Then extract the optimal average cost and a deterministic stationary policy. Also create a DataFrame summarizing the policy for each state. The dual LP has a variable g representing the average cost and variables h[s] representing the relative value function for each state. The constraints ensure that g + h[s] <= expected_cost(s,a) + sum_{s'} P(s'|s,a) h[s'] for all states s and actions a. After solving the LP, we extract the optimal policy by choosing the action that minimizes the right-hand side of the constraint for each state, using the optimal h values. We also create a DataFrame that includes the weekday, total stock, optimal order, Bellman minimum value, number of tied best actions, and the list of tied best actions for each state.
+def solve_average_cost_lp(
+    states: List[State],
+    actions_by_state: Dict[State, List[int]],
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+):
+    state_index = {s: i for i, s in enumerate(states)}
+    total_state_action_pairs = sum(len(actions) for actions in actions_by_state.values())
+
+    print("\nStarting solve_average_cost_lp")
+    print(f"Number of states:           {len(states):,}")
+    print(f"Number of state-action pairs: {total_state_action_pairs:,}")
+    print("-" * 72, flush=True)
+
+    transitions = {}
+    expected_cost = {}
+
+    # ------------------------------------------------------------
+    # 1. Build transitions and expected costs
+    # ------------------------------------------------------------
+    print("[1/4] Building transition distributions and expected costs...", flush=True)
+    progress = make_progress_printer(
+        total_state_action_pairs,
+        "[1/4] Transition building",
+    )
+
+    done = 0
+    for s in states:
+        for a in actions_by_state[s]:
+            dist, cost = transition_distribution_and_expected_cost(
+                s, a, demand_pmf, shelf_life
+            )
+            transitions[(s, a)] = dist
+            expected_cost[(s, a)] = cost
+
+            done += 1
+            progress(done)
+
+    print("[1/4] Transition building complete.", flush=True)
+
+    # ------------------------------------------------------------
+    # 2. Build Gurobi model
+    # ------------------------------------------------------------
+    print("[2/4] Building Gurobi LP model...", flush=True)
+
+    model = gp.Model("average_cost_dual_lp")
+
+    # Set this to 1 if you want Gurobi's own internal log.
+    # It does not give exact percentage progress, but it shows iterations.
+    model.Params.OutputFlag = 1
+
+    g = model.addVar(lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="g")
+    h = {
+        s: model.addVar(
+            lb=-GRB.INFINITY,
+            vtype=GRB.CONTINUOUS,
+            name=f"h_{state_index[s]}"
+        )
+        for s in states
+    }
+
+    # Anchor the relative value function.
+    # Without this, h is only identified up to an additive constant.
+    model.addConstr(h[states[0]] == 0.0, name="anchor_relative_value")
+
+    progress = make_progress_printer(
+        total_state_action_pairs,
+        "[2/4] Constraint building",
+    )
+
+    done = 0
+    for s in states:
+        for a in actions_by_state[s]:
+            rhs = expected_cost[(s, a)] + gp.quicksum(
+                p * h[ns] for ns, p in transitions[(s, a)].items()
+            )
+            model.addConstr(
+                g + h[s] <= rhs,
+                name=f"acoe_{state_index[s]}_{a}"
+            )
+
+            done += 1
+            progress(done)
+
+    model.setObjective(g, GRB.MAXIMIZE)
+
+    print("[2/4] LP model construction complete.", flush=True)
+    print(
+        f"Model has approximately {len(states):,} h-variables, "
+        f"1 g-variable, and {total_state_action_pairs:,} Bellman constraints.",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------
+    # 3. Optimize
+    # ------------------------------------------------------------
+    print("[3/4] Optimizing LP with Gurobi...", flush=True)
+    print(
+        "Note: Gurobi cannot honestly report exact 10%, 20%, ... progress "
+        "because the number of optimizer iterations is not known in advance.",
+        flush=True,
+    )
+
+    solve_start = time.perf_counter()
+    model.optimize()
+    solve_time = time.perf_counter() - solve_start
+
+    if model.Status != GRB.OPTIMAL:
+        raise RuntimeError(
+            f"Gurobi did not find an optimal solution. Status = {model.Status}"
+        )
+
+    g_star = float(g.X)
+    h_star = {s: float(h[s].X) for s in states}
+
+    print(
+        f"[3/4] Gurobi optimization complete. "
+        f"g* = {g_star:.6f}. Time: {solve_time:.1f}s",
+        flush=True,
+    )
+
+    # ------------------------------------------------------------
+    # 4. Extract deterministic policy
+    # ------------------------------------------------------------
+    print("[4/4] Extracting deterministic policy...", flush=True)
+
+    det_policy = {}
+    policy_rows = []
+
+    progress = make_progress_printer(
+        len(states),
+        "[4/4] Policy extraction",
+    )
+
+    for state_counter, s in enumerate(states, start=1):
+        scores = {}
+
+        for a in actions_by_state[s]:
+            score = expected_cost[(s, a)] + sum(
+                p * h_star[ns] for ns, p in transitions[(s, a)].items()
+            )
+            scores[a] = score
+
+        min_score = min(scores.values())
+        best_actions = [
+            a for a, val in scores.items()
+            if abs(val - min_score) <= REDUCED_COST_TOL
+        ]
+
+        # If several actions are numerically tied, choose the smallest order quantity.
+        chosen_action = min(best_actions)
+        det_policy[s] = chosen_action
+
+        row = {
+            "weekday": WEEKDAYS[s[0]],
+            "total_stock": sum(s[1:]),
+            "optimal_order": chosen_action,
+            "bellman_min_value": min_score,
+            "num_tied_best_actions": len(best_actions),
+            "tied_best_actions": str(best_actions),
+        }
+
+        for i in range(len(s) - 1):
+            row[f"x{i+1}"] = s[i+1]
+
+        policy_rows.append(row)
+
+        progress(state_counter)
+
+    policy_df = pd.DataFrame(policy_rows)
+
+    print("[4/4] Policy extraction complete.", flush=True)
+    print("solve_average_cost_lp finished.\n", flush=True)
+
+    return g_star, det_policy, policy_df
+
+
+# ============================================================
+# EVALUATE THE EXTRACTED POLICY
+# ============================================================
+
+# Given a deterministic policy, build the transition probability matrix P and cost vector c for the induced Markov chain. Also return the action taken in each state and the mapping from states to indices. The transition matrix P is constructed by iterating over each state, applying the deterministic policy to get the action, and then using the transition_distribution_and_expected_cost function to find the distribution over next states and the expected cost for that action. The cost vector c contains the expected cost for taking the action prescribed by the policy in each state. The action vector a_vec contains the action taken in each state according to the policy. The idx mapping allows us to convert between states and their corresponding indices in the matrix and vectors.
+def build_transition_matrix_under_policy(
+    states: List[State],
+    det_policy: Dict[State, int],
+    demand_pmf: np.ndarray,
+    shelf_life: int,
+):
+    idx = {s: i for i, s in enumerate(states)}
+    n = len(states)
+    P = np.zeros((n, n), dtype=float)
+    c = np.zeros(n, dtype=float)
+    a_vec = np.zeros(n, dtype=float)
+
+    for s in states:
+        i = idx[s]
+        a = det_policy[s]
+        dist, expected_cost = transition_distribution_and_expected_cost(s, a, demand_pmf, shelf_life)
+        c[i] = expected_cost
+        a_vec[i] = a
+        for ns, p in dist.items():
+            j = idx[ns]
+            P[i, j] += p
+
+    return P, c, a_vec, idx
+
+# Given the transition matrix P and cost vector c under a policy, compute the average cost by finding the stationary distribution of P and taking the weighted average of costs. The stationary distribution pi is found by solving the linear system pi = pi P with the normalization constraint sum(pi) = 1. Once we have pi, we can compute the average cost as the dot product of pi and c, which gives us the long-run average cost per time step under the given policy.
+def stationary_distribution_of_policy(P: np.ndarray) -> np.ndarray:
+    """
+    Solve pi = pi P, sum pi = 1
+    by replacing one equation with normalization.
+    """
+    n = P.shape[0]
+    A = P.T - np.eye(n)
+    b = np.zeros(n)
+
+    A[-1, :] = 1.0
+    b[-1] = 1.0
+
+    pi = np.linalg.solve(A, b)
+    pi = np.maximum(pi, 0.0)
+    pi = pi / pi.sum()
+    return pi
+
+# Build a DataFrame that includes the stationary probability of each state under the given policy, along with the optimal order and total stock. The DataFrame is sorted by stationary probability (descending), weekday (ascending), and total stock (ascending) to highlight the most likely states under the optimal policy. This table provides insights into which states are most frequently visited under the optimal policy and what actions are taken in those states.
+def build_state_probability_table(states: List[State], pi: np.ndarray, det_policy: Dict[State, int]) -> pd.DataFrame:
+    rows = []
+    for s, prob in zip(states, pi):
+        row = {
+            "weekday": WEEKDAYS[s[0]],
+            "stationary_probability": prob,
+            "total_stock": sum(s[1:]),
+            "optimal_order": det_policy[s],
+        }
+        for i in range(len(s) - 1):
+            row[f"x{i+1}"] = s[i+1]
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["stationary_probability", "weekday", "total_stock"], ascending=[False, True, True])
+    return df
+
+# This gives the most human-readable summary:
+# conditional on weekday, what does the optimal stationary policy typically order? The function iterates over each weekday, identifies the states corresponding to that weekday, and calculates the probability of being in those states under the stationary distribution. It then computes the expected order quantity given that weekday by taking a weighted average of the actions prescribed by the deterministic policy, using the stationary probabilities as weights. It also identifies the most likely action given the weekday and the distribution of actions. The resulting DataFrame summarizes the typical ordering behavior of the optimal policy for each weekday, which can be more interpretable than the full state-dependent policy. It includes the probability of each weekday, the expected order given the weekday, the most likely order, and the distribution of actions given the weekday.
+def build_weekday_recommendation_table(
+    states: List[State],
+    pi: np.ndarray,
+    det_policy: Dict[State, int],
+) -> pd.DataFrame:
+    """
+    This gives the most human-readable summary:
+    conditional on weekday, what does the optimal stationary policy typically order?
+    """
+    rows = []
+    for day in range(7):
+        state_indices = [i for i, s in enumerate(states) if s[0] == day]
+        day_prob = float(np.sum(pi[state_indices]))
+
+        action_mass = {}
+        expected_order = 0.0
+        for i in state_indices:
+            s = states[i]
+            prob = float(pi[i])
+            a = det_policy[s]
+            expected_order += prob * a
+            action_mass[a] = action_mass.get(a, 0.0) + prob
+
+        if day_prob > 0:
+            expected_order /= day_prob
+            conditional_action_mass = {a: mass / day_prob for a, mass in action_mass.items()}
+        else:
+            conditional_action_mass = {a: 0.0 for a in set(det_policy.values())}
+
+        most_likely_action = min(
+            [a for a, mass in conditional_action_mass.items() if mass == max(conditional_action_mass.values())]
+        )
+
+        row = {
+            "weekday": WEEKDAYS[day],
+            "probability_of_this_weekday": day_prob,
+            "expected_order_given_weekday": expected_order,
+            "most_likely_order_given_weekday": most_likely_action,
+            "action_distribution_given_weekday": str(
+                {a: round(mass, 4) for a, mass in sorted(conditional_action_mass.items()) if mass > 1e-8}
+            ),
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+# Filter the state probability table to include only states with stationary probability above a certain cutoff. This helps to focus on the most relevant states under the optimal policy, as many states may have negligible probability and can be ignored for practical decision-making. The resulting DataFrame will contain only the states that are significantly visited under the optimal policy, making it easier to analyze and interpret the policy's behavior in those states.
+def build_visited_state_table(state_prob_df: pd.DataFrame, cutoff: float = 1e-6) -> pd.DataFrame:
+    return state_prob_df[state_prob_df["stationary_probability"] > cutoff].copy()
+
+
+def probabilities_to_integer_frequencies(probabilities: np.ndarray, scale: int) -> np.ndarray:
+    """
+    Convert probabilities to integer frequencies that sum exactly to `scale`.
+
+    We use the largest-remainder method: first take floors, then distribute the
+    remaining counts to the cells with the largest fractional remainders. This
+    gives table entries that behave like simulated frequencies, but are based on
+    the exact stationary distribution.
+    """
+    probs = np.asarray(probabilities, dtype=float)
+    probs = np.maximum(probs, 0.0)
+
+    total = probs.sum()
+    if total <= 0:
+        return np.zeros_like(probs, dtype=int)
+
+    probs = probs / total
+    raw = probs * int(scale)
+    counts = np.floor(raw).astype(int)
+    remainder = int(scale) - int(counts.sum())
+
+    if remainder > 0:
+        fractional_parts = raw - counts
+        add_to = np.argsort(-fractional_parts)[:remainder]
+        counts[add_to] += 1
+
+    return counts
+
+
+def build_book_style_frequency_table_for_weekday(
+    policy_df: pd.DataFrame,
+    weekday: str,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> pd.DataFrame:
+    """
+    Build a book-style (state, action)-frequency table for one weekday.
+
+    Rows are post-order stock levels S_1 = x + a*(d,x), columns are pre-order
+    total stock levels x, and the entries are conditional frequencies for that
+    weekday. The frequencies are exact stationary probabilities scaled to `scale`,
+    not simulated counts.
+
+    This mimics the tables in Chapter 10, where rows are labelled "Up-to S_1",
+    columns are labelled "Stock x", and margins show Freq(S_1) and Freq(x).
+    """
+    group = policy_df[policy_df["weekday"] == weekday].copy()
+    if group.empty:
+        return pd.DataFrame({"Stock x": ["Up-to S_1", "Freq(x)", "Total simulated weekday observations"], "Freq(S_1)": ["", 0, 0]})
+
+    day_prob = float(group["stationary_probability"].sum())
+    if day_prob <= 0:
+        return pd.DataFrame({"Stock x": ["Up-to S_1", "Freq(x)", "Total simulated weekday observations"], "Freq(S_1)": ["", 0, 0]})
+
+    group["conditional_probability_given_weekday"] = group["stationary_probability"] / day_prob
+    group["post_order_stock"] = group["total_stock"] + group["optimal_order"]
+
+    prob_pivot = (
+        group.groupby(["post_order_stock", "total_stock"], as_index=True)["conditional_probability_given_weekday"]
+        .sum()
+        .unstack(fill_value=0.0)
+    )
+
+    # Convert the full matrix to integer frequencies summing exactly to scale.
+    counts_array = probabilities_to_integer_frequencies(prob_pivot.to_numpy().ravel(), scale)
+    count_matrix = pd.DataFrame(
+        counts_array.reshape(prob_pivot.shape),
+        index=prob_pivot.index.astype(int),
+        columns=prob_pivot.columns.astype(int),
+    )
+
+    # Keep only rows/columns that actually occur after rounding. This makes the
+    # table much more report-friendly and closer to the chapter 10 layout.
+    row_sums = count_matrix.sum(axis=1)
+    col_sums = count_matrix.sum(axis=0)
+    count_matrix = count_matrix.loc[row_sums > 0, col_sums > 0].copy()
+
+    if count_matrix.empty:
+        return pd.DataFrame({"Stock x": ["Up-to S_1", "Freq(x)", "Total simulated weekday observations"], "Freq(S_1)": ["", 0, 0]})
+
+    count_matrix = count_matrix.sort_index(ascending=False)
+    count_matrix = count_matrix.reindex(sorted(count_matrix.columns), axis=1)
+
+    row_sums = count_matrix.sum(axis=1).astype(int)
+    col_sums = count_matrix.sum(axis=0).astype(int)
+
+    # Blank out zero cells in the inner matrix to mimic the sparse table layout
+    # from the book. Margins remain numeric.
+    display_matrix = count_matrix.astype(object).where(count_matrix != 0, "")
+
+    rows = []
+    stock_columns = list(display_matrix.columns)
+    rows.append(["Up-to S_1"] + [""] * len(stock_columns) + [""])
+
+    for post_order_stock in display_matrix.index:
+        rows.append(
+            [int(post_order_stock)]
+            + [display_matrix.loc[post_order_stock, col] for col in stock_columns]
+            + [int(row_sums.loc[post_order_stock])]
+        )
+
+    rows.append(["Freq(x)"] + [int(col_sums.loc[col]) for col in stock_columns] + [int(col_sums.sum())])
+
+    table_df = pd.DataFrame(
+        rows,
+        columns=["Stock x"] + [str(int(c)) for c in stock_columns] + ["Freq(S_1)"],
+    )
+    return table_df
+
+
+def build_book_style_frequency_tables_by_weekday(
+    policy_df: pd.DataFrame,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Return one book-style frequency table per weekday.
+    """
+    return {
+        weekday: build_book_style_frequency_table_for_weekday(policy_df, weekday, scale=scale)
+        for weekday in WEEKDAYS
+    }
+
+
+def plot_book_style_frequency_table(
+    table_df: pd.DataFrame,
+    weekday: str,
+    output_path: Path,
+    scale: int = FREQUENCY_TABLE_SCALE,
+) -> None:
+    """
+    Save a table-like PNG version of the frequency table.
+
+    This is mainly useful for appendix material. For the main report, the Excel
+    tables are usually easier to copy into LaTeX and format cleanly.
+    """
+    if table_df.empty:
+        return
+
+    n_rows, n_cols = table_df.shape
+    fig_width = max(12, min(30, 0.45 * n_cols + 2.5))
+    fig_height = max(5, min(20, 0.32 * n_rows + 1.8))
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+    ax.set_title(
+        f"(State, action)-frequency table for {scale:,} stationary {weekday}s",
+        fontsize=12,
+        pad=12,
+    )
+
+    table = ax.table(
+        cellText=table_df.values,
+        colLabels=table_df.columns,
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    table.scale(1.0, 1.15)
+
+    # Slightly emphasize header, left label column, and margin row/column.
+    last_row = len(table_df)
+    last_col = len(table_df.columns) - 1
+    for (row, col), cell in table.get_celld().items():
+        if row == 0 or col == 0 or col == last_col or row == last_row:
+            cell.set_linewidth(0.8)
+        else:
+            cell.set_linewidth(0.25)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close()
+
+
+# ============================================================
+# OUTPUT HELPERS
+# ============================================================
+
+# Build a compact summary table that aggregates the optimal order by weekday and total stock level, showing the average optimal order and how many state profiles correspond to each (weekday, total_stock) pair. This table provides a more concise summary of the optimal policy by showing the typical order quantity for each combination of weekday and total stock level, along with the number of different inventory age profiles that lead to that combination. It can help identify general patterns in the optimal policy without having to look at every individual state.
+def build_compact_summary(policy_df: pd.DataFrame) -> pd.DataFrame:
+    summary = (
+        policy_df.groupby(["weekday", "total_stock"], sort=False)["optimal_order"]
+        .agg(["min", "max", "mean", "count"])
+        .reset_index()
+        .rename(columns={"mean": "avg_optimal_order", "count": "num_age_profiles"})
+    )
+    return summary
+
+# ============================================================
+# OUTPUT HELPERS (continued)    
+# ============================================================
+def plot_policy_heatmap_avg_order(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    
+
+    heatmap_df = (
+        policy_df.pivot_table(
+            index="weekday",
+            columns="total_stock",
+            values="optimal_order",
+            aggfunc="mean"
+        )
+        .reindex(WEEKDAYS)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(heatmap_df.to_numpy(), aspect="auto")
+    plt.colorbar(label="Average optimal order")
+    plt.xticks(
+        ticks=np.arange(len(heatmap_df.columns)),
+        labels=heatmap_df.columns
+    )
+    plt.yticks(
+        ticks=np.arange(len(heatmap_df.index)),
+        labels=heatmap_df.index
+    )
+    plt.xlabel("Total stock")
+    plt.ylabel("Weekday")
+    plt.title("Average optimal order by weekday and total stock")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_policy_heatmap_weighted_order(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    grouped_rows = []
+    for (weekday, total_stock), group in policy_df.groupby(["weekday", "total_stock"]):
+        w = group["stationary_probability"].to_numpy()
+        x = group["optimal_order"].to_numpy()
+
+        if np.sum(w) <= 0:
+            weighted_avg_order = np.nan
+        else:
+            weighted_avg_order = np.sum(w * x) / np.sum(w)
+
+        grouped_rows.append({
+            "weekday": weekday,
+            "total_stock": total_stock,
+            "weighted_avg_order": weighted_avg_order,
+        })
+
+    grouped = pd.DataFrame(grouped_rows)
+
+    heatmap_df = (
+        grouped.pivot(index="weekday", columns="total_stock", values="weighted_avg_order")
+        .reindex(WEEKDAYS)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(heatmap_df.to_numpy(), aspect="auto")
+    plt.colorbar(label="Weighted average optimal order")
+    plt.xticks(
+        ticks=np.arange(len(heatmap_df.columns)),
+        labels=heatmap_df.columns
+    )
+    plt.yticks(
+        ticks=np.arange(len(heatmap_df.index)),
+        labels=heatmap_df.index
+    )
+    plt.xlabel("Total stock")
+    plt.ylabel("Weekday")
+    plt.title("Weighted average optimal order by weekday and total stock")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_stationary_probability_by_stock(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    prob_df = (
+        policy_df.groupby(["weekday", "total_stock"], as_index=False)["stationary_probability"]
+        .sum()
+    )
+
+    heatmap_df = (
+        prob_df.pivot(index="weekday", columns="total_stock", values="stationary_probability")
+        .reindex(WEEKDAYS)
+        .fillna(0.0)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(heatmap_df.to_numpy(), aspect="auto")
+    plt.colorbar(label="Stationary probability")
+    plt.xticks(
+        ticks=np.arange(len(heatmap_df.columns)),
+        labels=heatmap_df.columns
+    )
+    plt.yticks(
+        ticks=np.arange(len(heatmap_df.index)),
+        labels=heatmap_df.index
+    )
+    plt.xlabel("Total stock")
+    plt.ylabel("Weekday")
+    plt.title("Stationary probability mass by weekday and total stock")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_policy_scatter_all_states(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    weekday_to_num = {day: i for i, day in enumerate(WEEKDAYS)}
+
+    x = policy_df["total_stock"]
+    y = policy_df["optimal_order"]
+    c = policy_df["weekday"].map(weekday_to_num)
+
+    plt.figure(figsize=(12, 6))
+    plt.scatter(x, y, c=c)
+    plt.xlabel("Total stock")
+    plt.ylabel("Optimal order")
+    plt.title("Optimal order for all states")
+    cbar = plt.colorbar()
+    cbar.set_ticks(range(len(WEEKDAYS)))
+    cbar.set_ticklabels(WEEKDAYS)
+    cbar.set_label("Weekday")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_policy_scatter_weighted_states(policy_df: pd.DataFrame, output_path: Path) -> None:
+
+    weekday_to_num = {day: i for i, day in enumerate(WEEKDAYS)}
+
+    x = policy_df["total_stock"]
+    y = policy_df["optimal_order"]
+    c = policy_df["weekday"].map(weekday_to_num)
+    sizes = 50 + 5000 * policy_df["stationary_probability"].fillna(0.0)
+
+    plt.figure(figsize=(12, 6))
+    plt.scatter(x, y, c=c, s=sizes, alpha=0.6)
+    plt.xlabel("Total stock")
+    plt.ylabel("Optimal order")
+    plt.title("Optimal order for visited states, weighted by stationary probability")
+    cbar = plt.colorbar()
+    cbar.set_ticks(range(len(WEEKDAYS)))
+    cbar.set_ticklabels(WEEKDAYS)
+    cbar.set_label("Weekday")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+def plot_order_distribution_by_weekday(policy_df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Plot the conditional distribution of optimal orders given each weekday.
+
+    For each weekday, the stacked bar sums to 1:
+        P(optimal_order = a | weekday)
+
+    The colors use a sequential color scale based on order size instead of
+    treating order sizes as unrelated categories.
+    """
+
+    dist_df = (
+        policy_df.groupby(["weekday", "optimal_order"], as_index=False)["stationary_probability"]
+        .sum()
+    )
+
+    pivot_df = (
+        dist_df.pivot(index="weekday", columns="optimal_order", values="stationary_probability")
+        .reindex(WEEKDAYS)
+        .fillna(0.0)
+    )
+
+    # Convert unconditional stationary mass into conditional mass given weekday.
+    row_sums = pivot_df.sum(axis=1)
+    pivot_df = pivot_df.div(row_sums.replace(0.0, np.nan), axis=0).fillna(0.0)
+
+    # Keep only order sizes that actually occur with positive conditional mass.
+    used_orders = [col for col in pivot_df.columns if pivot_df[col].sum() > 1e-12]
+    pivot_df = pivot_df[used_orders]
+
+    x = np.arange(len(pivot_df.index))
+    bottom = np.zeros(len(pivot_df.index))
+
+    plt.figure(figsize=(11, 6))
+
+    # Colorblind-friendly sequential colormap.
+    cmap = plt.get_cmap("cividis")
+
+    # Important: use the full possible action range so colors are comparable
+    # across different scenarios and plots.
+    norm = plt.Normalize(vmin=0, vmax=MAX_ORDER)
+
+    for order_val in pivot_df.columns:
+        vals = pivot_df[order_val].to_numpy()
+
+        plt.bar(
+            x,
+            vals,
+            bottom=bottom,
+            color=cmap(norm(order_val)),
+            edgecolor="white",
+            linewidth=0.35,
+        )
+
+        bottom += vals
+
+    plt.xticks(x, pivot_df.index, rotation=45, ha="right")
+    plt.xlabel("Weekday")
+    plt.ylabel("Conditional probability")
+    plt.ylim(0.0, 1.0)
+    plt.title("Conditional distribution of optimal order size by weekday")
+
+    # Replace the huge categorical legend with a colorbar.
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+
+    cbar = plt.colorbar(sm, ax=plt.gca())
+    cbar.set_label("Order size")
+    cbar.set_ticks(np.arange(0, MAX_ORDER + 1, 5))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close()
+
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+# Main function to load demand probabilities, build the state and action space, solve the average-cost MDP using the dual linear program, extract the optimal policy, evaluate it to find the stationary distribution and average cost, and save the results to an Excel file. The function also prints out key information about the problem setup, the optimal long-run cost, a readable summary of the policy by weekday, and the most visited states under the optimal policy. It ensures that the shelf life is at least 2, as the model assumes that there are at least two age buckets (x_1, x_2, ..., x_{m-1}) in the inventory vector. The outputs include the full optimal policy for all states, a compact summary by weekday and total stock, a table of visited states with their stationary probabilities, and a weekday-level recommendation table that summarizes the typical order quantity for each weekday under the optimal policy.
+def main():
+    if SHELF_LIFE < 2:
+        raise ValueError("SHELF_LIFE must be at least 2.")
+
+    demand_pmf, K = load_demand_probabilities(DEMAND_XLSX_PATH, DEMAND_SHEET_NAME)
+
+    min_demand_by_day = extract_min_demand_by_day(demand_pmf)
+    max_total_by_day = compute_max_total_inventory_by_day(min_demand_by_day)
+    print("Minimum demand with positive probability by weekday:", {WEEKDAYS[d]: k for d, k in min_demand_by_day.items()})
+    print("Computed upper bound on total inventory by weekday:", {WEEKDAYS[d]: max_total_by_day[d] for d in range(7)})
+
+    states = enumerate_states(INVENTORY_CAP, SHELF_LIFE)
+    print(f"States before filtering: {len(states)}")
+
+    states = [s for s in states if structurally_feasible_state(s, max_total_by_day)]
+    print(f"States after structural filtering: {len(states)}")
+
+    initial_state = (0,) + (0,) * (SHELF_LIFE - 1)
+
+    states = reachable_state_filter(
+        candidate_states=states,
+        demand_pmf=demand_pmf,
+        inventory_cap=INVENTORY_CAP,
+        max_order=MAX_ORDER,
+        production_days=PRODUCTION_DAYS,
+        shelf_life=SHELF_LIFE,
+        initial_states=[initial_state],
+    )
+
+    print(f"States after reachability filtering: {len(states)}")
+
+    assert_transition_closed(
+        states=states,
+        demand_pmf=demand_pmf,
+        inventory_cap=INVENTORY_CAP,
+        max_order=MAX_ORDER,
+        production_days=PRODUCTION_DAYS,
+        shelf_life=SHELF_LIFE,
+    )
+
+    actions_by_state = {
+        s: feasible_actions(s, INVENTORY_CAP, MAX_ORDER, PRODUCTION_DAYS)
+        for s in states
+    }
+    num_state_action_pairs = sum(len(v) for v in actions_by_state.values())
+
+    print("=" * 72)
+    print("STATIONARY AVERAGE-COST PLATELET MDP (DUAL LP)")
+    print("=" * 72)
+    print(f"Demand file:         {DEMAND_XLSX_PATH}")
+    print(f"Demand sheet:        {DEMAND_SHEET_NAME}")
+    print(f"Max demand K:        {K}")
+    print(f"Shelf life:          {SHELF_LIFE}")
+    print(f"Inventory cap:       {INVENTORY_CAP}")
+    print(f"Max order:           {MAX_ORDER}")
+    print(f"Production days:     {[WEEKDAYS[d] for d in sorted(PRODUCTION_DAYS)]}")
+    print(f"Costs:               c0={C_OUTDATE}, cs={C_SHORTAGE}, cH={C_HOLDING}, cp={C_PRODUCTION}")
+    print(f"Number of states:    {len(states)}")
+    print(f"State-action pairs:  {num_state_action_pairs}")
+    print("=" * 72)
+
+    g_star, det_policy, policy_df = solve_average_cost_lp(
+        states, actions_by_state, demand_pmf, SHELF_LIFE
+    )
+
+    # Evaluate the extracted policy so the recommendations become more interpretable
+    P, c_vec, a_vec, idx = build_transition_matrix_under_policy(states, det_policy, demand_pmf, SHELF_LIFE)
+    pi = stationary_distribution_of_policy(P)
+
+    policy_df["stationary_probability"] = pi
+    policy_df = policy_df.sort_values(
+        ["weekday", "stationary_probability", "total_stock"],
+        ascending=[True, False, True]
+    )
+
+    compact_df = build_compact_summary(policy_df)
+    state_prob_df = build_state_probability_table(states, pi, det_policy)
+    visited_state_df = build_visited_state_table(state_prob_df, cutoff=1e-6)
+    weekday_plan_df = build_weekday_recommendation_table(states, pi, det_policy)
+    frequency_tables_by_weekday = build_book_style_frequency_tables_by_weekday(
+        policy_df=policy_df,
+        scale=FREQUENCY_TABLE_SCALE,
+    )
+
+    g_eval = float(np.dot(pi, c_vec))
+
+    cost_breakdown_df, cost_breakdown = build_average_cost_breakdown_under_policy(
+        states=states,
+        pi=pi,
+        det_policy=det_policy,
+        demand_pmf=demand_pmf,
+        shelf_life=SHELF_LIFE,
+    )
+
+    run_summary_df = pd.DataFrame({
+        "metric": [
+            "optimal_average_cost_per_day_from_lp",
+            "optimal_average_cost_per_week_from_lp",
+            "average_cost_per_day_from_stationary_distribution",
+            "average_cost_per_week_from_stationary_distribution",
+            "number_of_states_after_filtering",
+            "number_of_state_action_pairs",
+            "shelf_life",
+            "inventory_cap",
+            "max_order",
+            "c_outdate",
+            "c_shortage",
+            "c_holding",
+            "c_production",
+            "component_cost_difference_vs_stationary_distribution",
+        ],
+        "value": [
+            g_star,
+            7.0 * g_star,
+            g_eval,
+            7.0 * g_eval,
+            len(states),
+            num_state_action_pairs,
+            SHELF_LIFE,
+            INVENTORY_CAP,
+            MAX_ORDER,
+            C_OUTDATE,
+            C_SHORTAGE,
+            C_HOLDING,
+            C_PRODUCTION,
+            cost_breakdown["total_cost"] - g_eval,
+        ]
+    })
+
+    # Save everything
+    with pd.ExcelWriter(OUTPUT_XLSX_PATH, engine="openpyxl") as writer:
+        run_summary_df.to_excel(writer, sheet_name="RunSummary", index=False)
+        cost_breakdown_df.to_excel(writer, sheet_name="CostBreakdown", index=False)
+        policy_df.to_excel(writer, sheet_name="OptimalPolicy_AllStates", index=False)
+        compact_df.to_excel(writer, sheet_name="CompactSummary", index=False)
+        weekday_plan_df.to_excel(writer, sheet_name="WeekdayPlan", index=False)
+        visited_state_df.to_excel(writer, sheet_name="VisitedStates", index=False)
+
+        for weekday, freq_table_df in frequency_tables_by_weekday.items():
+            sheet_name = f"Freq_{weekday[:3]}"
+            freq_table_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+
+    plot_policy_heatmap_avg_order(policy_df, PLOTS_DIR / "heatmap_avg_order.png")
+    plot_policy_heatmap_weighted_order(policy_df,PLOTS_DIR / "heatmap_weighted_order.png")
+    plot_stationary_probability_by_stock(policy_df,PLOTS_DIR / "heatmap_stationary_probability.png")
+    plot_order_distribution_by_weekday(policy_df,PLOTS_DIR / "order_distribution_by_weekday.png")
+
+    if PLOT_FREQUENCY_TABLES:
+        for weekday, freq_table_df in frequency_tables_by_weekday.items():
+            plot_book_style_frequency_table(
+                table_df=freq_table_df,
+                weekday=weekday,
+                output_path=PLOTS_DIR / f"frequency_table_{weekday.lower()}.png",
+                scale=FREQUENCY_TABLE_SCALE,
+            )
+
+    print("\nOPTIMAL LONG-RUN COST")
+    print(f"Per day:   {g_star:.6f}")
+    print(f"Per week:  {7.0 * g_star:.6f}")
+
+    print("\nMOST READABLE VERSION OF THE POLICY")
+    print("This is NOT the exact full policy, but the best weekday-level summary")
+    print("under the stationary distribution of the optimal policy:")
+    print(weekday_plan_df.to_string(index=False))
+
+    print("\nIMPORTANT WARNING")
+    print("The true optimal policy still depends on the FULL state (day, x1, ..., x_{m-1}).")
+    print("So there is no single fixed order for each weekday that is always optimal.")
+    print("But the table above tells you what the optimal policy TYPICALLY orders on each weekday.")
+
+    print("\nTOP VISITED STATES UNDER THE OPTIMAL POLICY")
+    print(visited_state_df.head(PRINT_TOP_ROWS).to_string(index=False))
+
+    print("\nSaved detailed outputs to:")
+    print(f"  {OUTPUT_XLSX_PATH}")
+    print(f"  Plots directory:           {PLOTS_DIR}")
+
+    
+
+
+if __name__ == "__main__":
+    main()
